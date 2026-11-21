@@ -1,0 +1,41 @@
+base_image: registry.access.redhat.com/ubi8/ubi:latest
+image_name: rhel8-auto-probe
+repo_name: LANLGeoMag
+max_loops: 5
+probe_commands:
+- make --version
+- g++ --version
+- autoreconf --version
+build_cmd: cd /app/repo && autoreconf -i && ./configure && make
+packages:
+- make
+- gcc
+- gcc-c++
+- autoconf
+- automake
+- libtool
+- diffutils
+- file
+- tar
+- gzip
+- patch
+- git
+- which
+- pkgconf-pkg-config
+source_builds:
+- name: gsl-2.8
+  script: set -eux; cd /tmp; curl -fL --retry 3 https://ftp.gnu.org/gnu/gsl/gsl-2.8.tar.gz -o gsl.tgz; tar xzf gsl.tgz; cd gsl-2.8; ./configure --prefix=/usr/local; make -j"$(nproc)"; make install; echo /usr/local/lib > /etc/ld.so.conf.d/usr-local.conf; ldconfig; cd /; rm -rf /tmp/gsl*
+- name: hdf5-1.14.4-3
+  script: set -eux; (dnf install -y zlib-devel || true); cd /tmp; curl -fL --retry 3 https://github.com/HDFGroup/hdf5/releases/download/hdf5_1.14.4.3/hdf5-1.14.4-3.tar.gz -o hdf5.tgz; tar xzf hdf5.tgz; cd hdf5-1.14.4-3; ./configure --prefix=/usr/local --enable-build-mode=production --enable-hl; make -j"$(nproc)"; make install; echo /usr/local/lib > /etc/ld.so.conf.d/usr-local.conf; ldconfig; test -f /usr/local/include/hdf5.h; cd /; rm -rf /tmp/hdf5*
+python: true
+python_version: '3.11'
+pip_packages:
+- python-dateutil
+- matplotlib
+- numpy
+- scipy
+- spacepy
+python_path:
+- /app/repo/Python
+- /app/repo/Python/ctypesgen
+install_cmd: cd /app/repo && make install && ldconfig
