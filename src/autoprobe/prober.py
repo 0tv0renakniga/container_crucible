@@ -50,6 +50,15 @@ def _dedupe(items: list[str]) -> list[str]:
     return out
 
 
+def _as_bool(value, default: bool = False) -> bool:
+    """YAML-friendly bool parser (accepts true/false/yes/no/1/0 strings)."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "0", "false", "no", "off"}
+    return bool(value)
+
+
 class Prober:
     def __init__(self, cfg: dict, cfg_path: Path, args: argparse.Namespace):
         self.cfg, self.cfg_path, self.args = cfg, cfg_path, args
@@ -104,6 +113,11 @@ class Prober:
         self.executable_builds: list[dict] = self._parse_executable_builds(
             cfg.get("executable_builds"))
 
+        # --- non-root runtime user for the generated image (new in 2B.1) ---
+        # These affect ONLY write_containerfile(), not the probe container.
+        self.runtime_user = self._parse_runtime_user(cfg.get("runtime_user"))
+        self.permissions = self._parse_permissions(cfg.get("permissions"), self.runtime_user)
+
     # ---- submodule_builds / executable_builds (new in 2A.2 / 2A.3) ---------
     def _parse_stage_common(self, item, where: str, repo: Path) -> dict:
         """Validate fields shared by submodule_builds and executable_builds."""
@@ -142,11 +156,7 @@ class Prober:
                 raise ValueError(f"{where}: invalid env var name {key!r}")
             env[key] = str(val)
 
-        required = item.get("required", True)
-        if isinstance(required, str):
-            required = required.strip().lower() not in {"", "0", "false", "no", "off"}
-        else:
-            required = bool(required)
+        required = _as_bool(item.get("required", True), True)
 
         return {
             "name": name,
@@ -253,6 +263,142 @@ class Prober:
             })
             stages.append(stage)
         return stages
+
+    # ---- runtime_user / permissions (new in 2B.1) --------------------------
+    def _parse_runtime_user(self, raw) -> dict | None:
+        """Validate config.yaml's optional `runtime_user:` setting.
+
+        `None`/absent preserves the original behavior (image runs as root).
+        Accepts either a user name string or a mapping.
+        """
+        if raw in (None, "", False):
+            return None
+        if isinstance(raw, str):
+            raw = {"name": raw}
+        if not isinstance(raw, dict):
+            raise ValueError("runtime_user must be a mapping, a user name, or null")
+
+        name = str(raw.get("name") or "").strip()
+        if not name:
+            raise ValueError("runtime_user: missing 'name'")
+        if not re.fullmatch(r"[a-z_][a-z0-9_-]*", name):
+            raise ValueError(
+                f"runtime_user: 'name' must match [a-z_][a-z0-9_-]* (got {name!r})")
+
+        def num(key: str, default: int) -> int:
+            val = raw.get(key, default)
+            try:
+                out = int(val)
+            except (TypeError, ValueError):
+                raise ValueError(f"runtime_user: '{key}' must be an integer")
+            if out < 1:
+                raise ValueError(f"runtime_user: '{key}' must be >= 1 (0 is root)")
+            return out
+
+        uid = num("uid", 1000)
+        gid = num("gid", uid)
+        group = str(raw.get("group") or name).strip()
+        if not re.fullmatch(r"[a-z_][a-z0-9_-]*", group):
+            raise ValueError(
+                f"runtime_user: 'group' must match [a-z_][a-z0-9_-]* (got {group!r})")
+
+        home = str(raw.get("home") or f"/home/{name}").strip()
+        if not home.startswith("/"):
+            raise ValueError("runtime_user: 'home' must be an absolute path")
+        shell = str(raw.get("shell") or "/bin/bash").strip()
+        if not shell.startswith("/"):
+            raise ValueError("runtime_user: 'shell' must be an absolute path")
+
+        return {
+            "name": name,
+            "group": group,
+            "uid": uid,
+            "gid": gid,
+            "home": home.rstrip("/") or "/",
+            "shell": shell,
+            "create": _as_bool(raw.get("create", True), True),
+        }
+
+    def _parse_permissions(self, raw, user: dict | None) -> dict:
+        """Validate config.yaml's optional `permissions:` block (2B.1).
+
+        Only meaningful with `runtime_user`. Defaults to recursively owning
+        /app (the build tree) and /opt/autoprobe (stage markers), plus
+        /opt/venv when a Python venv is built.
+        """
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, dict):
+            raise ValueError("permissions must be a mapping")
+        if user is None:
+            if raw:
+                raise ValueError("permissions requires runtime_user to be set")
+            return {"chown": [], "chmod": []}
+
+        chown_raw = raw.get("chown")
+        if chown_raw is None:
+            chown = ["/app", "/opt/autoprobe"]
+            if self.python:
+                chown.append("/opt/venv")
+        else:
+            if not isinstance(chown_raw, list):
+                raise ValueError("permissions: 'chown' must be a list of paths")
+            chown = []
+            for entry in chown_raw:
+                path = str(entry).strip()
+                if not path.startswith("/"):
+                    raise ValueError(
+                        f"permissions: chown path must be absolute (got {path!r})")
+                chown.append(path.rstrip("/") or "/")
+
+        chmod_raw = raw.get("chmod") or []
+        if not isinstance(chmod_raw, list):
+            raise ValueError("permissions: 'chmod' must be a list")
+        chmod: list[dict] = []
+        for idx, entry in enumerate(chmod_raw, 1):
+            where = f"permissions.chmod[{idx}]"
+            if isinstance(entry, str):
+                path, _, mode = entry.rpartition(":")
+            elif isinstance(entry, dict):
+                path = str(entry.get("path") or "").strip()
+                mode = str(entry.get("mode") or "").strip()
+            else:
+                raise ValueError(f"{where}: must be a mapping or 'path:mode' string")
+            path = str(path).strip()
+            if not path.startswith("/"):
+                raise ValueError(f"{where}: path must be absolute (got {path!r})")
+            if not re.fullmatch(r"[0-7]{3,4}", str(mode)):
+                raise ValueError(
+                    f"{where}: mode must be 3 or 4 octal digits (got {mode!r})")
+            chmod.append({"path": path, "mode": str(mode)})
+
+        return {"chown": _dedupe(chown), "chmod": chmod}
+
+    def _runtime_user_setup_script(self) -> str:
+        """Create the runtime user and fix ownership before the USER line."""
+        u = self.runtime_user
+        assert u is not None
+        owner = f"{shlex.quote(u['name'])}:{shlex.quote(u['group'])}"
+        lines = ["set -e"]
+        if u["create"]:
+            lines.append(
+                f"getent group {shlex.quote(u['group'])} >/dev/null 2>&1 || "
+                f"groupadd -g {u['gid']} {shlex.quote(u['group'])}")
+            lines.append(
+                f"getent passwd {shlex.quote(u['name'])} >/dev/null 2>&1 || "
+                f"useradd -u {u['uid']} -g {shlex.quote(u['group'])} "
+                f"-d {shlex.quote(u['home'])} -s {shlex.quote(u['shell'])} "
+                f"-m {shlex.quote(u['name'])}")
+        for path in self.permissions["chown"]:
+            q = shlex.quote(path)
+            lines.append(f"[ -e {q} ] && chown -R {owner} {q} || true")
+        for entry in self.permissions["chmod"]:
+            q = shlex.quote(entry["path"])
+            lines.append(f"[ -e {q} ] && chmod {entry['mode']} {q} || true")
+        if u["create"]:
+            q = shlex.quote(u["home"])
+            lines.append(f"[ -d {q} ] && chown {owner} {q} || true")
+        return "\n".join(lines)
 
     def submodule_export_dirs(self) -> dict[str, list[str]]:
         """All export directories contributed by submodule_builds, deduped."""
@@ -645,6 +791,11 @@ class Prober:
         # The build + install are baked into the image, so `podman run -it IMAGE` gives
         # a shell with everything already built.  A failing build fails `podman build`.
         L += ["", f"COPY {self.repo} /app/repo", run(self.script_build())]
+        if self.runtime_user:
+            u = self.runtime_user
+            L += ["", run(self._runtime_user_setup_script()),
+                  f"ENV HOME={u['home']}",
+                  f"USER {u['uid']}:{u['gid']}"]
         if self.test_cmd:
             L.append("CMD " + json.dumps(["/bin/bash", "-lc", self.test_cmd]))
         else:

@@ -85,3 +85,28 @@ executable_builds: []
 #     env:
 #       CC: gcc
 #     required: true
+
+# --- Phase 2B.1: non-root runtime user (opt-in) ---------------------------
+# Absent/null preserves the original behavior (the generated image runs as
+# root). This affects ONLY the generated Containerfile: the probe container
+# still builds as root so package installs and build stages keep working.
+# `permissions:` is optional; when omitted, /app and /opt/autoprobe (plus
+# /opt/venv when Python is enabled) are recursively owned by the runtime user.
+runtime_user: null
+# Example:
+# runtime_user:
+#   name: appuser
+#   group: appuser        # default: same as name
+#   uid: 1000
+#   gid: 1000             # default: same as uid
+#   home: /home/appuser
+#   shell: /bin/bash
+#   create: true          # false = user already exists in base image
+# permissions:
+#   chown:
+#     - /app
+#     - /opt/autoprobe
+#     - /opt/venv
+#   chmod:
+#     - path: /app/repo
+#       mode: "0775"
