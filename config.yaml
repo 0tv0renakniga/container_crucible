@@ -160,7 +160,13 @@ reproducible:
 #   manifest: autoprobe-manifest.json
 #   record_rpms: true
 #   record_pip: true
+#   record_repos: true             # record enabled dnf repos + GPG/URL config
+#   pin_repos: false               # also COPY a pinned .repo file into the image
+#   repo_file: /etc/yum.repos.d/autoprobe-pinned.repo
+# pin_repos replaces the base image's repo files at build time with the repos
+# recorded during probing (including CodeReady Builder when it was enabled).
 # Drift check: `autoprobe --manifest autoprobe-manifest.json` rebuilds and
-# compares the base digest, requested packages, pip freeze and file hashes.
+# compares the base digest, requested packages, pip freeze, enabled repos and
+# file hashes.
 # A drift failure exits non-zero and leaves the baseline file unchanged when
 # it is also the configured output path.

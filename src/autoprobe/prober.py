@@ -23,6 +23,10 @@ NEVRAs, pip freeze, and file hashes.
 Phase 3.2 adds `--manifest PATH`: rebuild, compare the fresh manifest against a
 saved one (base digest, requested packages, pip freeze, file hashes), print a
 drift report, and exit non-zero on drift.
+
+Phase 3.3 adds dnf repository pinning: record enabled repo IDs, URLs and GPG
+keys in the manifest, and optionally emit a pinned `.repo` file into the
+generated image so package resolution matches the probe run.
 """
 from __future__ import annotations
 
@@ -47,8 +51,15 @@ from .io_utils import LOG_FILE, say, stream
 DEFAULT_BASE = "registry.access.redhat.com/ubi8/ubi:latest"
 CONTAINERFILE = Path("Containerfile")
 ENV_FILE = Path("autoprobe-env.sh")
+PINNED_REPO_FILE = Path("autoprobe-pinned.repo")
 SUBMODULE_MARKER_DIR = "/opt/autoprobe/submodules"
 EXECUTABLE_MARKER_DIR = "/opt/autoprobe/executables"
+
+# Repo keys copied into the manifest and the generated pinned repo file.
+REPO_KEYS = ("name", "baseurl", "metalink", "mirrorlist", "gpgcheck",
+             "gpgkey", "sslverify", "enabled", "module_hotfixes",
+             "skip_if_unavailable")
+REPO_MULTI_KEYS = {"baseurl", "gpgkey"}
 
 # UBI ships a CodeReady Builder repo (disabled by default) with extra -devel packages.
 ENABLE_CRB = ("sed -i '/^\\[ubi-8-codeready-builder\\]/,/^\\[/ s/^enabled *= *0/enabled = 1/' "
@@ -98,6 +109,36 @@ def _sha256(path: Path) -> str:
     h = hashlib.sha256()
     h.update(path.read_bytes())
     return h.hexdigest()
+
+
+def _parse_repo_files(text: str) -> dict[str, dict[str, list[str]]]:
+    """Parse concatenated dnf `.repo` files into {id: {key: [values]}}.
+
+    `@@FILE path` separator lines are ignored. Continuation lines are folded
+    into the previous key; multi-value keys are split later.
+    """
+    repos: dict[str, dict[str, list[str]]] = {}
+    current: str | None = None
+    last_key: str | None = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", ";")) or line.startswith("@@FILE "):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1].strip()
+            repos.setdefault(current, {})
+            last_key = None
+            continue
+        if current is None:
+            continue
+        if "=" in line:
+            key, _, value = line.partition("=")
+            key = key.strip().lower()
+            repos[current].setdefault(key, []).append(value.strip())
+            last_key = key
+        elif last_key is not None and raw[:1].isspace():
+            repos[current][last_key].append(line)
+    return repos
 
 
 class Prober:
@@ -171,6 +212,8 @@ class Prober:
         # Opt-in: pin the base image by digest and write a build manifest.
         self.reproducible = self._parse_reproducible(cfg.get("reproducible"))
         self.base_digest = ""
+        self.repo_order: list[str] = []
+        self.repo_config: dict[str, dict] = {}
 
         # --- manifest drift check (new in 3.2) ---
         # --manifest PATH loads a saved manifest and compares a fresh build
@@ -522,7 +565,7 @@ class Prober:
         return tests
 
     def _parse_reproducible(self, raw) -> dict:
-        """Validate config.yaml's optional `reproducible:` block (new in 3.1).
+        """Validate config.yaml's optional `reproducible:` block (3.1 / 3.3).
 
         Absent/`enabled: false` preserves the original behavior: the
         Containerfile keeps the configured base tag and no manifest is written.
@@ -534,11 +577,19 @@ class Prober:
 
         enabled = _as_bool(raw.get("enabled"), False)
         pin_base = _as_bool(raw.get("pin_base"), enabled)
+        pin_repos = _as_bool(raw.get("pin_repos"), False)
 
         manifest = raw.get("manifest", "autoprobe-manifest.json")
         if manifest is None:
             manifest = ""
         manifest = str(manifest).strip()
+
+        repo_file = str(
+            raw.get("repo_file") or "/etc/yum.repos.d/autoprobe-pinned.repo").strip()
+        if not repo_file.startswith("/etc/yum.repos.d/") or not repo_file.endswith(".repo"):
+            raise ValueError(
+                "reproducible: 'repo_file' must be a .repo path under "
+                f"/etc/yum.repos.d/ (got {repo_file!r})")
 
         return {
             "enabled": enabled,
@@ -546,6 +597,9 @@ class Prober:
             "manifest": manifest,
             "record_rpms": _as_bool(raw.get("record_rpms"), True),
             "record_pip": _as_bool(raw.get("record_pip"), True),
+            "record_repos": _as_bool(raw.get("record_repos"), True),
+            "pin_repos": pin_repos,
+            "repo_file": repo_file,
         }
 
     def runtime_env_lines(self) -> list[str]:
@@ -834,6 +888,9 @@ class Prober:
         for s in self.sources:
             say(f"Re-running saved source build: {s['name']}")
             self.sh(s["script"])
+        if ((self.reproducible["enabled"] or self.drift)
+                and (self.reproducible["record_repos"] or self.reproducible["pin_repos"])):
+            self.collect_repos()
         return True
 
     def dnf_bulk(self, pkgs: list[str]) -> None:
@@ -991,6 +1048,69 @@ class Prober:
             return self.base_digest
         return self.base
 
+    def collect_repos(self) -> None:
+        """Record enabled dnf repos and their config (new in 3.3)."""
+        self.repo_order = []
+        self.repo_config = {}
+        rc, out = self.sh(
+            "dnf repolist --enabled 2>/dev/null | awk 'NR>1 && NF {print $1}'",
+            echo=False)
+        if rc:
+            say("Could not list enabled repos; skipping repo recording")
+            return
+        enabled = [line.strip() for line in out.splitlines() if line.strip()]
+        if not enabled:
+            return
+        rc, out = self.sh(
+            "for f in /etc/yum.repos.d/*.repo; do "
+            "[ -f \"$f\" ] && { echo \"@@FILE $f\"; cat \"$f\"; }; done",
+            echo=False)
+        if rc:
+            say("Could not read /etc/yum.repos.d; skipping repo recording")
+            return
+        parsed = _parse_repo_files(out)
+        for rid in enabled:
+            cfg = parsed.get(rid)
+            if not cfg:
+                continue
+            norm: dict[str, object] = {}
+            for key in REPO_KEYS:
+                if key not in cfg:
+                    continue
+                if key in REPO_MULTI_KEYS:
+                    items: list[str] = []
+                    for value in cfg[key]:
+                        items += value.split()
+                    if items:
+                        norm[key] = items
+                else:
+                    value = " ".join(cfg[key]).strip()
+                    if value:
+                        norm[key] = value
+            norm.setdefault("enabled", "1")
+            self.repo_order.append(rid)
+            self.repo_config[rid] = norm
+
+    def pinned_repo_text(self) -> str:
+        """Render the recorded repos as a dnf `.repo` file (new in 3.3)."""
+        if not self.repo_order:
+            return ""
+        lines = ["# Generated by autoprobe (reproducible.pin_repos)", ""]
+        for rid in self.repo_order:
+            cfg = self.repo_config[rid]
+            lines.append(f"[{rid}]")
+            for key in REPO_KEYS:
+                if key not in cfg:
+                    continue
+                value = cfg[key]
+                if isinstance(value, list):
+                    for item in value:
+                        lines.append(f"{key}={item}")
+                else:
+                    lines.append(f"{key}={value}")
+            lines.append("")
+        return "\n".join(lines)
+
     def collect_manifest(self) -> dict:
         """Collect the manifest data (installed RPMs, pip freeze, file hashes)."""
         rep = self.reproducible
@@ -1009,7 +1129,7 @@ class Prober:
                 pip_freeze = [line.strip() for line in out.splitlines() if line.strip()]
 
         files: dict[str, str] = {}
-        for name in (str(CONTAINERFILE), ENV_FILE.name):
+        for name in (str(CONTAINERFILE), ENV_FILE.name, PINNED_REPO_FILE.name):
             path = Path(name)
             if path.is_file():
                 files[name] = _sha256(path)
@@ -1042,6 +1162,13 @@ class Prober:
                 "read_only": self.runtime["read_only"],
             },
             "smoke_tests": [t["name"] for t in self.smoke_tests],
+            "repos": ({"enabled": list(self.repo_order), "config": self.repo_config}
+                      if rep["record_repos"] else {}),
+            "repo_pinning": {
+                "enabled": bool(rep["pin_repos"] and self.repo_order),
+                "file": rep["repo_file"],
+                "sha256": files.get(PINNED_REPO_FILE.name, ""),
+            },
             "files_sha256": files,
         }
 
@@ -1100,6 +1227,19 @@ class Prober:
             if bits:
                 add("pip", "; ".join(bits))
 
+        old_repos = set((base.get("repos") or {}).get("enabled") or [])
+        new_repos = set((fresh.get("repos") or {}).get("enabled") or [])
+        if old_repos and new_repos:
+            added_r = sorted(new_repos - old_repos)
+            removed_r = sorted(old_repos - new_repos)
+            if added_r or removed_r:
+                bits = []
+                if added_r:
+                    bits.append("+ " + ", +".join(added_r))
+                if removed_r:
+                    bits.append("- " + ", -".join(removed_r))
+                add("repos", "; ".join(bits))
+
         old_files = base.get("files_sha256") or {}
         new_files = fresh.get("files_sha256") or {}
         if old_files and new_files:
@@ -1134,6 +1274,12 @@ class Prober:
         def run(script: str) -> str:
             return "RUN " + json.dumps(["/bin/bash", "-lc", script])
 
+        pinned = (self.pinned_repo_text()
+                  if self.reproducible["enabled"] and self.reproducible["pin_repos"]
+                  else "")
+        if pinned:
+            PINNED_REPO_FILE.write_text(pinned)
+
         sub = self.submodule_export_dirs()
         ld_dirs = _dedupe([*sub["lib"], "/usr/local/lib", "/usr/local/lib64"])
         L = [f"FROM {self.containerfile_base()}", f"WORKDIR {self.runtime['workdir']}", "",
@@ -1156,7 +1302,12 @@ class Prober:
         L += self.runtime_env_lines()
         L += [
               "COPY autoprobe-env.sh /etc/profile.d/autoprobe.sh"]
-        if self.enable_crb:
+        if pinned:
+            # Replace the base image's repo definitions so dnf resolves packages
+            # against exactly the repos that were enabled during probing.
+            L.append(run("rm -f /etc/yum.repos.d/*.repo"))
+            L.append(f"COPY {PINNED_REPO_FILE.name} {self.reproducible['repo_file']}")
+        elif self.enable_crb:
             L.append(run(ENABLE_CRB))
         L.append(run(f"dnf install -y {' '.join(self.pkgs)} && dnf clean all"))
         if self.python:
