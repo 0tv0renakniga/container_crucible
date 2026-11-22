@@ -15,15 +15,21 @@ and read-only-friendly writable locations.
 
 Phase 2B.3 adds `smoke_tests:` entries that `--verify` runs in the built image
 with the final user/read-only settings, plus a pass/fail report.
+
+Phase 3.1 adds opt-in `reproducible:` support: pin the base image by digest in
+the generated Containerfile and write a JSON build manifest with installed RPM
+NEVRAs, pip freeze, and file hashes.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import shlex
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -73,6 +79,21 @@ def _env_line(key: str, value: str) -> str:
     if re.fullmatch(r"[A-Za-z0-9_./:@%+,-]*", value):
         return f"ENV {key}={value}"
     return f"ENV {key}={json.dumps(value)}"
+
+
+def _base_repo(ref: str) -> str:
+    """Strip a tag or digest from an image reference, keeping any registry port."""
+    ref = ref.split("@", 1)[0]
+    head, sep, tail = ref.rpartition("/")
+    if ":" in tail:
+        tail = tail.split(":", 1)[0]
+    return f"{head}{sep}{tail}"
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    h.update(path.read_bytes())
+    return h.hexdigest()
 
 
 class Prober:
@@ -141,6 +162,11 @@ class Prober:
         # --- final-image smoke tests run by --verify (new in 2B.3) ---
         # Absent/empty smoke_tests preserves original verification behavior.
         self.smoke_tests: list[dict] = self._parse_smoke_tests(cfg.get("smoke_tests"))
+
+        # --- reproducible builds (new in 3.1) ---
+        # Opt-in: pin the base image by digest and write a build manifest.
+        self.reproducible = self._parse_reproducible(cfg.get("reproducible"))
+        self.base_digest = ""
 
     # ---- submodule_builds / executable_builds (new in 2A.2 / 2A.3) ---------
     def _parse_stage_common(self, item, where: str, repo: Path) -> dict:
@@ -473,6 +499,33 @@ class Prober:
             })
         return tests
 
+    def _parse_reproducible(self, raw) -> dict:
+        """Validate config.yaml's optional `reproducible:` block (new in 3.1).
+
+        Absent/`enabled: false` preserves the original behavior: the
+        Containerfile keeps the configured base tag and no manifest is written.
+        """
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, dict):
+            raise ValueError("reproducible must be a mapping")
+
+        enabled = _as_bool(raw.get("enabled"), False)
+        pin_base = _as_bool(raw.get("pin_base"), enabled)
+
+        manifest = raw.get("manifest", "autoprobe-manifest.json")
+        if manifest is None:
+            manifest = ""
+        manifest = str(manifest).strip()
+
+        return {
+            "enabled": enabled,
+            "pin_base": pin_base,
+            "manifest": manifest,
+            "record_rpms": _as_bool(raw.get("record_rpms"), True),
+            "record_pip": _as_bool(raw.get("record_pip"), True),
+        }
+
     def runtime_env_lines(self) -> list[str]:
         """ENV lines contributed by the `runtime:` block (new in 2B.2)."""
         lines: list[str] = []
@@ -734,6 +787,10 @@ class Prober:
         rc, _ = stream(["podman", "run", "-d", "--name", self.cname, self.base, "sleep", "infinity"])
         if rc:
             return False
+        if self.reproducible["enabled"]:
+            self.base_digest = self.resolve_base_digest()
+            if self.base_digest:
+                say(f"Resolved base image digest: {self.base_digest}")
         self.write_support_files()
         stream(["podman", "exec", self.cname, "mkdir", "-p", "/app/repo"], echo=False)
         say("Copying repository into the container")
@@ -885,13 +942,100 @@ class Prober:
             c["source_builds"] = self.sources
         self.cfg_path.write_text(yaml.safe_dump(c, sort_keys=False, width=1000))
 
+    # ---- reproducibility (new in 3.1) --------------------------------------
+    def resolve_base_digest(self) -> str:
+        """Return `repo@sha256:...` for the configured base image, or ""."""
+        if "@sha256:" in self.base:
+            return self.base
+        repo = _base_repo(self.base)
+        for fmt in ("{{.Digest}}", "{{index .RepoDigests 0}}"):
+            rc, out = stream(
+                ["podman", "image", "inspect", "--format", fmt, self.base],
+                echo=False)
+            if rc:
+                continue
+            val = out.strip().splitlines()[-1].strip() if out.strip() else ""
+            if "@sha256:" in val:
+                return val
+            if val.startswith("sha256:"):
+                return f"{repo}@{val}"
+        say(f"Could not resolve a digest for {self.base}; keeping the tag")
+        return ""
+
+    def containerfile_base(self) -> str:
+        """FROM value: the pinned digest when enabled, else the tag."""
+        if (self.reproducible["enabled"] and self.reproducible["pin_base"]
+                and self.base_digest):
+            return self.base_digest
+        return self.base
+
+    def write_manifest(self) -> None:
+        """Write the opt-in build manifest (installed RPMs, pip freeze, hashes)."""
+        rep = self.reproducible
+        if not rep["enabled"] or not rep["manifest"]:
+            return
+
+        rpms: list[str] = []
+        if rep["record_rpms"]:
+            rc, out = self.sh(
+                "rpm -qa --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\\n' | LC_ALL=C sort",
+                echo=False)
+            if rc == 0:
+                rpms = [line.strip() for line in out.splitlines() if line.strip()]
+
+        pip_freeze: list[str] = []
+        if self.python and rep["record_pip"]:
+            rc, out = self.sh("/opt/venv/bin/pip freeze", echo=False)
+            if rc == 0:
+                pip_freeze = [line.strip() for line in out.splitlines() if line.strip()]
+
+        files: dict[str, str] = {}
+        for name in (str(CONTAINERFILE), ENV_FILE.name):
+            path = Path(name)
+            if path.is_file():
+                files[name] = _sha256(path)
+
+        data = {
+            "schema": 1,
+            "generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "image_name": self.image,
+            "repo_name": self.repo,
+            "base_image": {
+                "configured": self.base,
+                "resolved": self.base_digest or self.base,
+                "pinned": bool(self.base_digest),
+                "from": self.containerfile_base(),
+            },
+            "build": {
+                "build_cmd": self.build_cmd,
+                "install_cmd": self.install_cmd,
+                "test_cmd": self.test_cmd or "",
+            },
+            "packages_requested": list(self.pkgs),
+            "packages_installed": rpms,
+            "pip_freeze": pip_freeze,
+            "source_builds": [s.get("name", "") for s in self.sources],
+            "submodule_builds": [s["name"] for s in self.submodule_builds],
+            "executable_builds": [s["name"] for s in self.executable_builds],
+            "runtime": {
+                "user": self.runtime_user,
+                "workdir": self.runtime["workdir"],
+                "read_only": self.runtime["read_only"],
+            },
+            "smoke_tests": [t["name"] for t in self.smoke_tests],
+            "files_sha256": files,
+        }
+        path = Path(rep["manifest"])
+        path.write_text(json.dumps(data, indent=2) + "\n")
+        say(f"Wrote {path}")
+
     def write_containerfile(self) -> None:
         def run(script: str) -> str:
             return "RUN " + json.dumps(["/bin/bash", "-lc", script])
 
         sub = self.submodule_export_dirs()
         ld_dirs = _dedupe([*sub["lib"], "/usr/local/lib", "/usr/local/lib64"])
-        L = [f"FROM {self.base}", f"WORKDIR {self.runtime['workdir']}", "",
+        L = [f"FROM {self.containerfile_base()}", f"WORKDIR {self.runtime['workdir']}", "",
              f"ENV LD_LIBRARY_PATH={':'.join(ld_dirs)}", "ENV MPLBACKEND=Agg"]
         if self.python:
             L.append("ENV VIRTUAL_ENV=/opt/venv")
@@ -1059,6 +1203,7 @@ class Prober:
             return 1
 
         self.write_containerfile()
+        self.write_manifest()
         if not self.args.keep:
             stream(["podman", "rm", "-f", self.cname], echo=False)
         if self.args.verify:

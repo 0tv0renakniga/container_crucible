@@ -144,3 +144,19 @@ smoke_tests: []
 #     script: python -c "import matplotlib.pyplot as plt; plt.figure()"
 #     required: false
 # A bare string is shorthand for {name: smoke-N, script: <string>, required: true}.
+
+# --- Phase 3.1: reproducible builds (opt-in) ------------------------------
+# enabled: false preserves the original behavior (base tag kept, no manifest).
+# When enabled, autoprobe records the resolved base digest, installed RPM
+# NEVRAs and pip freeze in a JSON manifest. pin_base rewrites the generated
+# Containerfile FROM line to `repo@sha256:...` (falls back to the tag if the
+# digest cannot be resolved).
+reproducible:
+  enabled: false
+# Example:
+# reproducible:
+#   enabled: true
+#   pin_base: true                 # default: same as enabled
+#   manifest: autoprobe-manifest.json
+#   record_rpms: true
+#   record_pip: true
