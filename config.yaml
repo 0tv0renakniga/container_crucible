@@ -127,3 +127,20 @@ runtime: {}
 # XDG_CONFIG_HOME, MPLCONFIGDIR and PYTHONDONTWRITEBYTECODE, creates/chowns
 # /tmp/.cache, /tmp/.config and /tmp/matplotlib, and `--verify` runs the image
 # with `--read-only --tmpfs /tmp`.
+
+# --- Phase 2B.3: final-image smoke tests for --verify (opt-in) ------------
+# Empty/absent preserves the original verification behavior. Each test runs in
+# its own `podman run --rm IMAGE` with the final image's WORKDIR, USER, ENV and
+# read-only settings. A required failure makes `--verify` exit non-zero; an
+# optional (required: false) failure is reported as WARN and does not fail.
+smoke_tests: []
+# Example (replace the empty list above):
+# smoke_tests:
+#   - name: imports
+#     script: python -c "import numpy, scipy, spacepy"
+#   - name: version
+#     script: python -c "import LanlGeoMag; print(LanlGeoMag.__version__)"
+#   - name: optional-plot
+#     script: python -c "import matplotlib.pyplot as plt; plt.figure()"
+#     required: false
+# A bare string is shorthand for {name: smoke-N, script: <string>, required: true}.

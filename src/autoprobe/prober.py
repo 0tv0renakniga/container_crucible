@@ -12,6 +12,9 @@ Phase 2B.1/2B.2 add opt-in final-image hardening (`runtime_user:` /
 `permissions:` / `runtime:`). The probe container still builds as root; only
 the generated Containerfile gains a user, ownership fixes, WORKDIR/ENV values,
 and read-only-friendly writable locations.
+
+Phase 2B.3 adds `smoke_tests:` entries that `--verify` runs in the built image
+with the final user/read-only settings, plus a pass/fail report.
 """
 from __future__ import annotations
 
@@ -25,6 +28,7 @@ from pathlib import Path
 
 import yaml
 
+from . import io_utils
 from .config_loader import BASELINE, BLOCKED, ENV_SCRIPT, SOURCE_RECIPES
 from .detect import detect_project, scan_python
 from .diagnose import command_action, diagnose
@@ -133,6 +137,10 @@ class Prober:
         # --- final-image runtime hardening (new in 2B.2) ---
         # WORKDIR / extra ENV / read-only-friendly writable locations.
         self.runtime = self._parse_runtime(cfg.get("runtime"))
+
+        # --- final-image smoke tests run by --verify (new in 2B.3) ---
+        # Absent/empty smoke_tests preserves original verification behavior.
+        self.smoke_tests: list[dict] = self._parse_smoke_tests(cfg.get("smoke_tests"))
 
     # ---- submodule_builds / executable_builds (new in 2A.2 / 2A.3) ---------
     def _parse_stage_common(self, item, where: str, repo: Path) -> dict:
@@ -426,6 +434,44 @@ class Prober:
             "env": env,
             "read_only": _as_bool(raw.get("read_only"), False),
         }
+
+    def _parse_smoke_tests(self, raw) -> list[dict]:
+        """Validate config.yaml's optional `smoke_tests:` list (new in 2B.3).
+
+        Each entry runs in its own `podman run --rm IMAGE` during `--verify`,
+        using the final image's WORKDIR, user, and read-only settings.
+        """
+        if raw is None:
+            return []
+        if not isinstance(raw, list):
+            raise ValueError("smoke_tests must be a list")
+
+        tests: list[dict] = []
+        seen: set[str] = set()
+        for idx, item in enumerate(raw, 1):
+            where = f"smoke_tests[{idx}]"
+            if isinstance(item, str):
+                item = {"script": item}
+            if not isinstance(item, dict):
+                raise ValueError(f"{where}: must be a string or a mapping")
+
+            script = item.get("script")
+            if not isinstance(script, str) or not script.strip():
+                raise ValueError(f"{where}: 'script' must be a non-empty string")
+
+            name = str(item.get("name") or f"smoke-{idx}").strip()
+            if not name:
+                raise ValueError(f"{where}: 'name' must not be empty")
+            if name in seen:
+                raise ValueError(f"{where}: duplicate name {name!r}")
+            seen.add(name)
+
+            tests.append({
+                "name": name,
+                "script": script.rstrip("\n") + "\n",
+                "required": _as_bool(item.get("required", True), True),
+            })
+        return tests
 
     def runtime_env_lines(self) -> list[str]:
         """ENV lines contributed by the `runtime:` block (new in 2B.2)."""
@@ -895,6 +941,82 @@ class Prober:
         CONTAINERFILE.write_text("\n".join(L))
         say(f"Wrote {CONTAINERFILE}")
 
+    # ---- verification (new in 2B.3) -----------------------------------------
+    def podman_run_args(self) -> list[str]:
+        """`podman run` prefix matching the final image's runtime settings."""
+        args = ["podman", "run", "--rm"]
+        if self.runtime["read_only"]:
+            args += ["--read-only", "--tmpfs", "/tmp"]
+        return args
+
+    @staticmethod
+    def verify_report(results: list[tuple[str, str, str]]) -> None:
+        """Print (and log) the --verify summary."""
+        print("\n=== verification report ===")
+        width = max((len(name) for name, _, _ in results), default=0)
+        for name, status, detail in results:
+            line = f"  {status:<4}  {name:<{width}}  {detail}".rstrip()
+            print(line)
+            if io_utils.LOGF:
+                io_utils.LOGF.write(line + "\n")
+        print()
+
+    def verify(self) -> int:
+        """Clean `podman build` + smoke-test runs, then print a report."""
+        say("Verifying with a clean podman build + run")
+        results: list[tuple[str, str, str]] = []
+        failed = False
+
+        if stream(["podman", "build", "-t", self.image, "."])[0]:
+            results.append(("build", "FAIL", "podman build failed"))
+            self.verify_report(results)
+            return 1
+        results.append(("build", "PASS", self.image))
+
+        mode = ("read-only (/tmp tmpfs)" if self.runtime["read_only"]
+                else "writable rootfs")
+        results.append(("mode", "INFO", mode))
+
+        # Identity probe: only enforced when runtime_user is configured, so
+        # base images that already define a USER keep their previous behavior.
+        rc, out = stream([*self.podman_run_args(), self.image,
+                          "/bin/bash", "-lc", "id -u; id -un"], echo=False)
+        if rc:
+            results.append(("runtime user", "FAIL", f"identity probe rc={rc}"))
+            failed = True
+        else:
+            parts = out.split()
+            uid = parts[0] if parts else "?"
+            uname = parts[1] if len(parts) > 1 else "?"
+            if self.runtime_user is None:
+                results.append(("runtime user", "INFO", f"uid {uid} ({uname})"))
+            elif uid != str(self.runtime_user["uid"]):
+                results.append(("runtime user", "FAIL",
+                                f"uid {uid} ({uname}), expected {self.runtime_user['uid']}"))
+                failed = True
+            else:
+                results.append(("runtime user", "PASS", f"uid {uid} ({uname})"))
+
+        # The image's default CMD (test_cmd when configured).
+        rc, _ = stream([*self.podman_run_args(), self.image])
+        label = "test_cmd" if self.test_cmd else "image CMD"
+        results.append((label, "PASS" if rc == 0 else "FAIL", f"rc={rc}"))
+        failed = failed or rc != 0
+
+        for test in self.smoke_tests:
+            rc, _ = stream([*self.podman_run_args(), self.image,
+                            "/bin/bash", "-lc", test["script"]])
+            if rc == 0:
+                results.append((test["name"], "PASS", "rc=0"))
+            elif test["required"]:
+                results.append((test["name"], "FAIL", f"rc={rc}"))
+                failed = True
+            else:
+                results.append((test["name"], "WARN", f"rc={rc} (optional)"))
+
+        self.verify_report(results)
+        return 1 if failed else 0
+
     # ---- main loop ----------------------------------------------------------
     def run(self) -> int:
         say(f"Detected project type: {self.project['label']}")
@@ -932,21 +1054,15 @@ class Prober:
                   f"  podman exec -it {self.cname} bash -l\n"
                   f"Add anything you find to config.yaml (packages / pip_packages / env / "
                   f"source_builds / submodule_builds / executable_builds / "
-                  f"runtime_user / runtime / build_cmd) and re-run.", file=sys.stderr)
+                  f"runtime_user / runtime / smoke_tests / build_cmd) and re-run.",
+                  file=sys.stderr)
             return 1
 
         self.write_containerfile()
         if not self.args.keep:
             stream(["podman", "rm", "-f", self.cname], echo=False)
         if self.args.verify:
-            say("Verifying with a clean podman build + run")
-            if stream(["podman", "build", "-t", self.image, "."])[0]:
-                return 1
-            run_args = ["podman", "run", "--rm"]
-            if self.runtime["read_only"]:
-                run_args += ["--read-only", "--tmpfs", "/tmp"]
-            run_args.append(self.image)
-            if stream(run_args)[0]:
+            if self.verify():
                 return 1
         else:
             ro = " --read-only --tmpfs /tmp" if self.runtime["read_only"] else ""
