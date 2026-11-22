@@ -2,6 +2,11 @@
 prober.py - the Prober class: drives a long-lived podman container through
 repeated probe/build/fix/retry cycles, and emits the final Containerfile and
 config.yaml on success.
+
+Phase 2A.2 adds opt-in C/C++ submodule build stages (`submodule_builds:` in
+config.yaml). Each stage is built once per autoprobe run, before build_cmd, and
+its install tree is exported into PATH / LD_LIBRARY_PATH / PKG_CONFIG_PATH /
+CPPFLAGS / LDFLAGS / CMAKE_PREFIX_PATH for later stages and the main build.
 """
 from __future__ import annotations
 
@@ -23,6 +28,7 @@ from .io_utils import LOG_FILE, say, stream
 DEFAULT_BASE = "registry.access.redhat.com/ubi8/ubi:latest"
 CONTAINERFILE = Path("Containerfile")
 ENV_FILE = Path("autoprobe-env.sh")
+SUBMODULE_MARKER_DIR = "/opt/autoprobe/submodules"
 
 # UBI ships a CodeReady Builder repo (disabled by default) with extra -devel packages.
 ENABLE_CRB = ("sed -i '/^\\[ubi-8-codeready-builder\\]/,/^\\[/ s/^enabled *= *0/enabled = 1/' "
@@ -30,6 +36,17 @@ ENABLE_CRB = ("sed -i '/^\\[ubi-8-codeready-builder\\]/,/^\\[/ s/^enabled *= *0/
 
 NEVRA = re.compile(
     r"^(?P<n>\S+?)-(?:\d+:)?\d[^\s]*?\.(?:x86_64|aarch64|noarch|i686|ppc64le|s390x)\s+:")
+
+
+def _dedupe(items: list[str]) -> list[str]:
+    """Order-preserving de-duplication (used for generated export paths)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
 
 
 class Prober:
@@ -76,6 +93,203 @@ class Prober:
         self.sources: list[dict] = list(cfg.get("source_builds") or [])
         self.tried: set[tuple[str, str]] = set()
 
+        # --- C/C++ submodule build stages (new in 2A.2) ---
+        # Absent/empty submodule_builds preserves original behavior exactly.
+        self.submodule_builds: list[dict] = self._parse_submodule_builds(
+            cfg.get("submodule_builds"))
+
+    # ---- submodule_builds (new in 2A.2) ------------------------------------
+    def _parse_submodule_builds(self, raw) -> list[dict]:
+        """Validate/normalize config.yaml's optional `submodule_builds:` list.
+
+        Absent/empty means no stages (original behavior). Each returned stage
+        has concrete defaults so the rest of Prober never re-checks YAML.
+        """
+        if raw is None:
+            return []
+        if not isinstance(raw, list):
+            raise ValueError("submodule_builds must be a list of mappings")
+
+        stages: list[dict] = []
+        seen: set[str] = set()
+        repo = Path(self.repo)
+
+        for idx, item in enumerate(raw, 1):
+            where = f"submodule_builds[{idx}]"
+            if not isinstance(item, dict):
+                raise ValueError(f"{where} must be a mapping")
+
+            name = str(item.get("name") or "").strip()
+            path = str(item.get("path") or "").strip()
+            script = item.get("script")
+
+            if not name:
+                raise ValueError(f"{where}: missing 'name'")
+            if name in (".", "..") or not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+                raise ValueError(
+                    f"{where}: 'name' must match [A-Za-z0-9_.-]+ and not be '.' or '..'")
+            if name in seen:
+                raise ValueError(f"{where}: duplicate name {name!r}")
+            seen.add(name)
+
+            if not path:
+                raise ValueError(f"{where}: missing 'path'")
+            rel = Path(path)
+            if rel.is_absolute() or ".." in rel.parts:
+                raise ValueError(
+                    f"{where}: 'path' must be relative to repo_name and stay inside it")
+            if not (repo / rel).is_dir():
+                raise ValueError(f"{where}: path not found: {repo / rel}")
+
+            if not isinstance(script, str) or not script.strip():
+                raise ValueError(f"{where}: 'script' must be a non-empty string")
+
+            prefix = str(item.get("prefix") or "/usr/local").strip()
+            if not prefix.startswith("/"):
+                raise ValueError(f"{where}: 'prefix' must be an absolute path")
+            if prefix != "/":
+                prefix = prefix.rstrip("/") or "/"
+            base = "" if prefix == "/" else prefix
+
+            env_raw = item.get("env") or {}
+            if not isinstance(env_raw, dict):
+                raise ValueError(f"{where}: 'env' must be a mapping")
+            env: dict[str, str] = {}
+            for key, val in env_raw.items():
+                key = str(key)
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                    raise ValueError(f"{where}: invalid env var name {key!r}")
+                env[key] = str(val)
+
+            required = item.get("required", True)
+            if isinstance(required, str):
+                required = required.strip().lower() not in {"", "0", "false", "no", "off"}
+            else:
+                required = bool(required)
+
+            def dirs(key: str, defaults: list[str]) -> list[str]:
+                val = item.get(key)
+                if val is None:
+                    return defaults
+                if not isinstance(val, list):
+                    raise ValueError(f"{where}: '{key}' must be a list")
+                out: list[str] = []
+                for entry in val:
+                    entry = str(entry).rstrip("/") or "/"
+                    if not entry.startswith("/"):
+                        raise ValueError(
+                            f"{where}: '{key}' entries must be absolute paths")
+                    out.append(entry)
+                return out
+
+            stages.append({
+                "name": name,
+                "path": rel.as_posix(),
+                "script": script.rstrip("\n") + "\n",
+                "prefix": prefix,
+                "env": env,
+                "required": required,
+                "bin_dirs": dirs("bin_dirs", [f"{base}/bin"]),
+                "lib_dirs": dirs("lib_dirs", [f"{base}/lib", f"{base}/lib64"]),
+                "include_dirs": dirs("include_dirs", [f"{base}/include"]),
+                "pkgconfig_dirs": dirs("pkgconfig_dirs", [
+                    f"{base}/lib/pkgconfig",
+                    f"{base}/lib64/pkgconfig",
+                    f"{base}/share/pkgconfig",
+                ]),
+            })
+        return stages
+
+    def submodule_export_dirs(self) -> dict[str, list[str]]:
+        """All export directories contributed by submodule_builds, deduped."""
+        bins: list[str] = []
+        libs: list[str] = []
+        incs: list[str] = []
+        pcs: list[str] = []
+        prefixes: list[str] = []
+        for s in self.submodule_builds:
+            bins.extend(s["bin_dirs"])
+            libs.extend(s["lib_dirs"])
+            incs.extend(s["include_dirs"])
+            pcs.extend(s["pkgconfig_dirs"])
+            prefixes.append(s["prefix"])
+        return {
+            "bin": _dedupe(bins),
+            "lib": _dedupe(libs),
+            "include": _dedupe(incs),
+            "pkgconfig": _dedupe(pcs),
+            "prefix": _dedupe(prefixes),
+        }
+
+    def submodule_env_block(self) -> str:
+        """Shell exports appended after ENV_SCRIPT (empty when unused)."""
+        d = self.submodule_export_dirs()
+        lines: list[str] = []
+
+        if d["bin"]:
+            dirs = ":".join(shlex.quote(p) for p in d["bin"])
+            lines.append(f"export PATH={dirs}${{PATH:+:$PATH}}")
+        if d["lib"]:
+            dirs = ":".join(shlex.quote(p) for p in d["lib"])
+            lines.append(
+                f"export LD_LIBRARY_PATH={dirs}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}")
+        if d["pkgconfig"]:
+            dirs = ":".join(shlex.quote(p) for p in d["pkgconfig"])
+            lines.append(
+                f"export PKG_CONFIG_PATH={dirs}${{PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}}")
+        if d["include"]:
+            flags = " ".join(f"-I{p}" for p in d["include"])
+            lines.append(f'export CPPFLAGS="{flags} ${{CPPFLAGS:-}}"')
+        if d["lib"]:
+            flags = " ".join(f"-L{p}" for p in d["lib"])
+            lines.append(f'export LDFLAGS="{flags} ${{LDFLAGS:-}}"')
+        if d["prefix"]:
+            dirs = ":".join(shlex.quote(p) for p in d["prefix"])
+            lines.append(
+                f"export CMAKE_PREFIX_PATH={dirs}${{CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}}")
+
+        if not lines:
+            return ""
+        return ("# --- submodule_builds exports (generated by autoprobe) ---\n"
+                + "\n".join(lines) + "\n")
+
+    def submodule_stage_script(self, stage: dict) -> str:
+        """One idempotent, diagnose-friendly shell block for a single stage."""
+        marker = f"{SUBMODULE_MARKER_DIR}/{stage['name']}"
+        done_q = shlex.quote(marker + ".done")
+        skipped_q = shlex.quote(marker + ".skipped")
+        repo_q = shlex.quote(f"/app/repo/{stage['path']}")
+
+        env_lines = [f"export AP_PREFIX={shlex.quote(stage['prefix'])}"]
+        env_lines += [f"export {k}={shlex.quote(v)}" for k, v in stage["env"].items()]
+        body = "\n".join(env_lines) + "\n" + stage["script"]
+
+        required = "1" if stage["required"] else "0"
+        skip_msg = f">>> Submodule [{stage['name']}] already handled; skipping"
+        build_msg = f">>> Building submodule [{stage['name']}] ({stage['path']})"
+        fail_msg = f"!! Submodule [{stage['name']}] failed"
+
+        return (
+            f"if [ -f {done_q} ] || [ -f {skipped_q} ]; then\n"
+            f"  echo {shlex.quote(skip_msg)}\n"
+            f"else\n"
+            f"  echo {shlex.quote(build_msg)}\n"
+            f"  mkdir -p {shlex.quote(SUBMODULE_MARKER_DIR)}\n"
+            f"  if (\n"
+            f"    cd {repo_q}\n"
+            f"{body}"
+            f"  ); then\n"
+            f"    touch {done_q}\n"
+            f"  else\n"
+            f"    echo {shlex.quote(fail_msg)} >&2\n"
+            f"    if [ {required} -eq 1 ]; then exit 1; else touch {skipped_q}; fi\n"
+            f"  fi\n"
+            f"fi"
+        )
+
+    def submodule_stage_scripts(self) -> list[str]:
+        return [self.submodule_stage_script(s) for s in self.submodule_builds]
+
     # ---- container plumbing -------------------------------------------------
     def sh(self, script: str, echo: bool = True) -> tuple[int, str]:
         return stream(["podman", "exec", self.cname, "bash", "-lc", script], echo=echo)
@@ -85,7 +299,12 @@ class Prober:
         if self.py_paths():
             extra = (f"export PYTHONPATH={':'.join(self.py_paths())}${{PYTHONPATH:+:$PYTHONPATH}}\n"
                      + extra)
-        return ENV_SCRIPT + extra
+        parts = [ENV_SCRIPT]
+        if not ENV_SCRIPT.endswith("\n"):
+            parts.append("\n")
+        parts.append(self.submodule_env_block())
+        parts.append(extra)
+        return "".join(parts)
 
     def write_support_files(self) -> None:
         ENV_FILE.write_text(self.env_text())
@@ -123,10 +342,6 @@ class Prober:
         # one at a time and in order: some sdists (spacepy...) need numpy present first
         return " && ".join(f"pip install {shlex.quote(p)}" for p in pkgs)
 
-    def script_build(self) -> str:
-        cmds = [*self.probes, self.build_cmd] + ([self.install_cmd] if self.install_cmd else [])
-        return "set -eo pipefail\n" + "\n".join(cmds)
-
     def py_paths(self) -> list[str]:
         """Installed copy first (it contains generated files like Lgm_Wrap.py), then repo dirs.
         `make install` puts modules under /usr/local, which the venv python does NOT search."""
@@ -136,9 +351,19 @@ class Prober:
                       f"/usr/local/lib64/python{self.pyver}/site-packages"]
         return paths + self.pypath
 
+    def build_steps(self) -> list[str]:
+        cmds = [*self.probes, *self.submodule_stage_scripts(), self.build_cmd]
+        if self.install_cmd:
+            cmds.append(self.install_cmd)
+        return cmds
+
+    def script_build(self) -> str:
+        return "set -eo pipefail\n" + "\n".join(self.build_steps())
+
     def script_run(self) -> str:
-        cmds = ([*self.probes, self.build_cmd] + ([self.install_cmd] if self.install_cmd else [])
-                + ([self.test_cmd] if self.test_cmd else []))
+        cmds = self.build_steps()
+        if self.test_cmd:
+            cmds.append(self.test_cmd)
         return "set -eo pipefail\n" + "\n".join(cmds)
 
     def start(self) -> bool:
@@ -301,10 +526,24 @@ class Prober:
     def write_containerfile(self) -> None:
         def run(script: str) -> str:
             return "RUN " + json.dumps(["/bin/bash", "-lc", script])
+
+        sub = self.submodule_export_dirs()
+        ld_dirs = _dedupe([*sub["lib"], "/usr/local/lib", "/usr/local/lib64"])
         L = [f"FROM {self.base}", "WORKDIR /app", "",
-             "ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib64", "ENV MPLBACKEND=Agg"]
+             f"ENV LD_LIBRARY_PATH={':'.join(ld_dirs)}", "ENV MPLBACKEND=Agg"]
         if self.python:
-            L += ["ENV VIRTUAL_ENV=/opt/venv", "ENV PATH=/opt/venv/bin:/usr/local/bin:$PATH"]
+            L.append("ENV VIRTUAL_ENV=/opt/venv")
+        path_dirs = _dedupe([*sub["bin"],
+                             *(["/opt/venv/bin", "/usr/local/bin"] if self.python else [])])
+        if path_dirs:
+            L.append(f"ENV PATH={':'.join(path_dirs)}:$PATH")
+        if sub["pkgconfig"]:
+            pkg_dirs = _dedupe([*sub["pkgconfig"], "/usr/local/lib/pkgconfig",
+                                "/usr/local/lib64/pkgconfig", "/usr/lib64/pkgconfig"])
+            L.append(f"ENV PKG_CONFIG_PATH={':'.join(pkg_dirs)}")
+        if sub["prefix"]:
+            cmake_dirs = _dedupe([*sub["prefix"], "/usr/local", "/usr"])
+            L.append(f"ENV CMAKE_PREFIX_PATH={':'.join(cmake_dirs)}")
         if self.py_paths():
             L.append(f"ENV PYTHONPATH={':'.join(self.py_paths())}")
         L += [
@@ -368,7 +607,7 @@ class Prober:
             print(f"\nFAILED. Full log: {LOG_FILE}\nInspect the container with:\n"
                   f"  podman exec -it {self.cname} bash -l\n"
                   f"Add anything you find to config.yaml (packages / pip_packages / env / "
-                  f"source_builds / build_cmd) and re-run.", file=sys.stderr)
+                  f"source_builds / submodule_builds / build_cmd) and re-run.", file=sys.stderr)
             return 1
 
         self.write_containerfile()
@@ -384,4 +623,3 @@ class Prober:
             print(f"\nSUCCESS. The build is baked into the image. Tinker with:\n"
                   f"  podman build -t {self.image} . && podman run --rm -it {self.image}")
         return 0
-

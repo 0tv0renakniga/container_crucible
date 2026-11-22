@@ -59,6 +59,9 @@ def main() -> int:
         io_utils.LOGF = f
         try:
             return Prober(cfg, cfg_path, args).run()
+        except ValueError as exc:
+            print(f"Invalid config: {exc}", file=sys.stderr)
+            return 1
         except KeyboardInterrupt:
             print("\nInterrupted. Probe container left running for inspection.", file=sys.stderr)
             return 130

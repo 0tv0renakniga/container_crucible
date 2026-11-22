@@ -42,3 +42,25 @@ install_cmd: cd /app/repo && make install && ldconfig
 venv:
   reuse: false   # default; always rm -rf /opt/venv and recreate (original behavior)
   # reuse: true  # opt-in; skip recreation if /opt/venv already matches python_version
+
+# --- Phase 2A.2: C/C++ submodule build stages (opt-in) ---------------------
+# Empty/absent preserves the original behavior. Each stage builds once per run,
+# before build_cmd, with cwd=/app/repo/<path> and $AP_PREFIX exported.
+# Required keys: name, path, script. Optional: prefix (default /usr/local),
+# env, required (default true), and lib_dirs/include_dirs/bin_dirs/pkgconfig_dirs
+# overrides. A failing required stage aborts the build (and is diagnosable);
+# required: false warns and continues.
+submodule_builds: []
+# Example (replace the empty list above and add cmake to `packages`):
+# submodule_builds:
+#   - name: bundled-lib
+#     path: third_party/bundled-lib
+#     prefix: /opt/autoprobe/bundled-lib
+#     script: |
+#       set -eux
+#       cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$AP_PREFIX"
+#       cmake --build build -j"$(nproc)"
+#       cmake --install build
+#     env:
+#       CC: gcc
+#     required: true
