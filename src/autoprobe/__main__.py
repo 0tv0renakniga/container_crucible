@@ -11,7 +11,8 @@ How it works
    then `dnf provides` for headers / libs / commands / pkg-config / cmake modules,
    then pip for Python modules), installs it inside the SAME container, retries.
 4. When the build passes, writes Containerfile + updates config.yaml.
-   Optional --verify does a clean `podman build` + `podman run` of the result.
+   Optional --verify does a clean `podman build` + `podman run` of the result,
+   and --manifest PATH compares the fresh build against a saved manifest.
 
 Works for: autotools, CMake, Meson, plain Makefile, and Python projects
 (pyproject / setup.py / requirements.txt, built in a venv at /opt/venv).
@@ -41,6 +42,8 @@ def main() -> int:
     ap.add_argument("-n", "--max-loops", type=int, default=0, help="override max_loops")
     ap.add_argument("--verify", action="store_true", help="clean podman build+run at the end")
     ap.add_argument("--keep", action="store_true", help="keep probe container after success")
+    ap.add_argument("--manifest", metavar="PATH",
+                    help="compare a fresh build against this saved manifest (drift check)")
     args = ap.parse_args()
 
     if not shutil.which("podman"):
@@ -53,6 +56,9 @@ def main() -> int:
     cfg = yaml.safe_load(cfg_path.read_text()) or {}
     if not cfg.get("repo_name") or not Path(cfg["repo_name"]).is_dir():
         print(f"repo_name directory not found: {cfg.get('repo_name')}", file=sys.stderr)
+        return 1
+    if args.manifest and not Path(args.manifest).is_file():
+        print(f"Manifest not found: {args.manifest}", file=sys.stderr)
         return 1
 
     with LOG_FILE.open("w") as f:

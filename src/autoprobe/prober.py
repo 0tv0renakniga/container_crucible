@@ -19,6 +19,10 @@ with the final user/read-only settings, plus a pass/fail report.
 Phase 3.1 adds opt-in `reproducible:` support: pin the base image by digest in
 the generated Containerfile and write a JSON build manifest with installed RPM
 NEVRAs, pip freeze, and file hashes.
+
+Phase 3.2 adds `--manifest PATH`: rebuild, compare the fresh manifest against a
+saved one (base digest, requested packages, pip freeze, file hashes), print a
+drift report, and exit non-zero on drift.
 """
 from __future__ import annotations
 
@@ -167,6 +171,24 @@ class Prober:
         # Opt-in: pin the base image by digest and write a build manifest.
         self.reproducible = self._parse_reproducible(cfg.get("reproducible"))
         self.base_digest = ""
+
+        # --- manifest drift check (new in 3.2) ---
+        # --manifest PATH loads a saved manifest and compares a fresh build
+        # against it. It implies digest resolution but not manifest output.
+        raw_manifest = getattr(args, "manifest", None)
+        self.manifest_baseline_path = Path(raw_manifest) if raw_manifest else None
+        self.manifest_baseline: dict | None = None
+        if self.manifest_baseline_path is not None:
+            try:
+                loaded = json.loads(self.manifest_baseline_path.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"could not read manifest {self.manifest_baseline_path}: {exc}")
+            if not isinstance(loaded, dict):
+                raise ValueError(
+                    f"manifest {self.manifest_baseline_path} is not a JSON object")
+            self.manifest_baseline = loaded
+        self.drift = self.manifest_baseline_path is not None
 
     # ---- submodule_builds / executable_builds (new in 2A.2 / 2A.3) ---------
     def _parse_stage_common(self, item, where: str, repo: Path) -> dict:
@@ -787,7 +809,7 @@ class Prober:
         rc, _ = stream(["podman", "run", "-d", "--name", self.cname, self.base, "sleep", "infinity"])
         if rc:
             return False
-        if self.reproducible["enabled"]:
+        if self.reproducible["enabled"] or self.drift:
             self.base_digest = self.resolve_base_digest()
             if self.base_digest:
                 say(f"Resolved base image digest: {self.base_digest}")
@@ -969,12 +991,9 @@ class Prober:
             return self.base_digest
         return self.base
 
-    def write_manifest(self) -> None:
-        """Write the opt-in build manifest (installed RPMs, pip freeze, hashes)."""
+    def collect_manifest(self) -> dict:
+        """Collect the manifest data (installed RPMs, pip freeze, file hashes)."""
         rep = self.reproducible
-        if not rep["enabled"] or not rep["manifest"]:
-            return
-
         rpms: list[str] = []
         if rep["record_rpms"]:
             rc, out = self.sh(
@@ -995,7 +1014,7 @@ class Prober:
             if path.is_file():
                 files[name] = _sha256(path)
 
-        data = {
+        return {
             "schema": 1,
             "generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "image_name": self.image,
@@ -1025,9 +1044,91 @@ class Prober:
             "smoke_tests": [t["name"] for t in self.smoke_tests],
             "files_sha256": files,
         }
+
+    def write_manifest(self, data: dict | None = None) -> None:
+        """Write the opt-in build manifest (no-op when disabled)."""
+        rep = self.reproducible
+        if not rep["enabled"] or not rep["manifest"]:
+            return
         path = Path(rep["manifest"])
-        path.write_text(json.dumps(data, indent=2) + "\n")
+        path.write_text(json.dumps(data or self.collect_manifest(), indent=2) + "\n")
         say(f"Wrote {path}")
+
+    def check_drift(self, fresh: dict) -> bool:
+        """Compare a fresh manifest against --manifest; return True if equal."""
+        base = self.manifest_baseline or {}
+        problems: list[str] = []
+
+        def add(label: str, detail: str) -> None:
+            problems.append(f"{label}: {detail}")
+
+        if base.get("schema") != fresh.get("schema"):
+            add("schema", f"{base.get('schema')} -> {fresh.get('schema')}")
+
+        old_base = (base.get("base_image") or {}).get("resolved", "")
+        new_base = (fresh.get("base_image") or {}).get("resolved", "")
+        if old_base != new_base:
+            add("base image", f"{old_base or '?'} -> {new_base or '?'}")
+
+        old_pkgs = set(base.get("packages_requested") or [])
+        new_pkgs = set(fresh.get("packages_requested") or [])
+        added = sorted(new_pkgs - old_pkgs)
+        removed = sorted(old_pkgs - new_pkgs)
+        if added or removed:
+            bits = []
+            if added:
+                bits.append("+ " + ", +".join(added))
+            if removed:
+                bits.append("- " + ", -".join(removed))
+            add("packages", "; ".join(bits))
+
+        def pip_map(items) -> dict[str, str]:
+            out: dict[str, str] = {}
+            for item in items or []:
+                name, sep, ver = str(item).partition("==")
+                out[name] = ver if sep else ""
+            return out
+
+        if "pip_freeze" in base and "pip_freeze" in fresh:
+            old_pip = pip_map(base.get("pip_freeze"))
+            new_pip = pip_map(fresh.get("pip_freeze"))
+            bits = []
+            for name in sorted(set(old_pip) | set(new_pip)):
+                if old_pip.get(name) != new_pip.get(name):
+                    bits.append(f"{name}: {old_pip.get(name) or '-'} -> "
+                                f"{new_pip.get(name) or '-'}")
+            if bits:
+                add("pip", "; ".join(bits))
+
+        old_files = base.get("files_sha256") or {}
+        new_files = fresh.get("files_sha256") or {}
+        if old_files and new_files:
+            for name in sorted(set(old_files) | set(new_files)):
+                if old_files.get(name) != new_files.get(name):
+                    add(f"file {name}",
+                        f"{old_files.get(name) or 'missing'} -> "
+                        f"{new_files.get(name) or 'missing'}")
+
+        print("\n=== manifest drift ===")
+        if problems:
+            for problem in problems:
+                line = f"  DRIFT  {problem}"
+                print(line)
+                if io_utils.LOGF:
+                    io_utils.LOGF.write(line + "\n")
+            tail = f"  baseline: {self.manifest_baseline_path}"
+            print(tail)
+            if io_utils.LOGF:
+                io_utils.LOGF.write(tail + "\n")
+            print()
+            return False
+
+        line = "  OK     no drift detected"
+        print(line)
+        if io_utils.LOGF:
+            io_utils.LOGF.write(line + "\n")
+        print()
+        return True
 
     def write_containerfile(self) -> None:
         def run(script: str) -> str:
@@ -1165,6 +1266,8 @@ class Prober:
     def run(self) -> int:
         say(f"Detected project type: {self.project['label']}")
         say(f"Build command: {self.build_cmd}")
+        if self.drift:
+            say(f"Drift check against {self.manifest_baseline_path}")
         if not self.start():
             print("Could not start container (is podman working?)", file=sys.stderr)
             return 1
@@ -1203,7 +1306,25 @@ class Prober:
             return 1
 
         self.write_containerfile()
-        self.write_manifest()
+
+        manifest = None
+        if self.reproducible["enabled"] or self.drift:
+            manifest = self.collect_manifest()
+
+        drift_ok = True
+        if self.drift:
+            drift_ok = self.check_drift(manifest or self.collect_manifest())
+
+        if (self.reproducible["enabled"] and self.reproducible["manifest"]
+                and manifest is not None):
+            out_path = Path(self.reproducible["manifest"])
+            same = (self.manifest_baseline_path is not None
+                    and out_path.resolve() == self.manifest_baseline_path.resolve())
+            if drift_ok or not same:
+                self.write_manifest(manifest)
+            else:
+                say(f"Drift detected; leaving baseline {out_path} unchanged")
+
         if not self.args.keep:
             stream(["podman", "rm", "-f", self.cname], echo=False)
         if self.args.verify:
@@ -1214,4 +1335,8 @@ class Prober:
             print(f"\nSUCCESS. The build is baked into the image. Tinker with:\n"
                   f"  podman build -t {self.image} . && "
                   f"podman run --rm -it{ro} {self.image}")
+        if not drift_ok:
+            print("\nManifest drift detected. Re-run with reproducible.enabled: true "
+                  "to record a new baseline.", file=sys.stderr)
+            return 1
         return 0

@@ -160,3 +160,7 @@ reproducible:
 #   manifest: autoprobe-manifest.json
 #   record_rpms: true
 #   record_pip: true
+# Drift check: `autoprobe --manifest autoprobe-manifest.json` rebuilds and
+# compares the base digest, requested packages, pip freeze and file hashes.
+# A drift failure exits non-zero and leaves the baseline file unchanged when
+# it is also the configured output path.
