@@ -45,6 +45,12 @@ class Prober:
         self.test_cmd = cfg.get("test_cmd")
         self.user_env = cfg.get("env") or {}
 
+        # --- venv lifecycle control (new in 2A.1) ---
+        # Default False preserves the original always-recreate behavior of
+        # script_python(); set `venv: {reuse: true}` in config.yaml to opt in
+        # to reusing an existing /opt/venv that already matches python_version.
+        self.venv_reuse = bool((cfg.get("venv") or {}).get("reuse", False))
+
         proj = detect_project(Path(self.repo))
         self.project = proj
         self.build_cmd = cfg.get("build_cmd") or proj["build"]
@@ -90,6 +96,28 @@ class Prober:
                 f"&& dnf clean all && python{v} -m venv /opt/venv "
                 f"&& /opt/venv/bin/pip install -U pip setuptools wheel")
 
+    def venv_check_script(self) -> str:
+        """Exit 0 iff a venv already exists at /opt/venv for the currently
+        requested Python version (self.pyver). Used only when venv.reuse is
+        enabled; a version change naturally fails this check, so switching
+        python_version still forces a rebuild even with reuse enabled."""
+        v = self.pyver
+        return f"test -x /opt/venv/bin/python{v}"
+
+    def setup_venv(self) -> tuple[int, str]:
+        """Create the /opt/venv virtualenv, or - if venv.reuse is enabled in
+        config.yaml and a venv already exists for the current python_version -
+        skip recreation and reuse it. Default (venv.reuse: false) always
+        recreates, identical to calling script_python() directly as the
+        original code did at every call site."""
+        if self.venv_reuse:
+            rc, _ = self.sh(self.venv_check_script(), echo=False)
+            if rc == 0:
+                say(f"Reusing existing /opt/venv (python{self.pyver})")
+                return 0, ""
+            say(f"No reusable /opt/venv (python{self.pyver}) found; creating it")
+        return self.sh(self.script_python())
+
     @staticmethod
     def pip_cmd(pkgs: list[str]) -> str:
         # one at a time and in order: some sdists (spacepy...) need numpy present first
@@ -131,7 +159,7 @@ class Prober:
         self.dnf_bulk(self.pkgs)
         if self.python:
             say(f"Setting up Python {self.pyver} venv")
-            if self.sh(self.script_python())[0]:
+            if self.setup_venv()[0]:
                 print("!! python setup failed; continuing without it", file=sys.stderr)
             else:
                 if self.pips:
@@ -179,7 +207,7 @@ class Prober:
             return False
         if not self.python:
             self.python = True
-            if self.sh(self.script_python())[0]:
+            if self.setup_venv()[0]:
                 return False
         rc, self.last_out = self.sh(f"pip install {shlex.quote(name)}")
         if rc == 0:
@@ -246,10 +274,10 @@ class Prober:
             if self.python:
                 return False
             self.python = True
-            return self.sh(self.script_python())[0] == 0
+            return self.setup_venv()[0] == 0
         if kind == "pyver":
             self.pyver = arg
-            if self.sh(self.script_python())[0]:
+            if self.setup_venv()[0]:
                 return False
             if self.pips:
                 self.sh(self.pip_cmd(self.pips))
@@ -285,6 +313,9 @@ class Prober:
             L.append(run(ENABLE_CRB))
         L.append(run(f"dnf install -y {' '.join(self.pkgs)} && dnf clean all"))
         if self.python:
+            # A fresh `podman build` always starts from clean image layers, so there
+            # is never an existing venv to reuse here - venv.reuse only applies to
+            # the long-lived probe container during `autoprobe`'s own run() loop.
             L.append(run(self.script_python()))
             if self.pips:
                 L.append(run(self.pip_cmd(self.pips)))
@@ -353,3 +384,4 @@ class Prober:
             print(f"\nSUCCESS. The build is baked into the image. Tinker with:\n"
                   f"  podman build -t {self.image} . && podman run --rm -it {self.image}")
         return 0
+

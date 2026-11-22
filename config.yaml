@@ -39,3 +39,6 @@ python_path:
 - /app/repo/Python
 - /app/repo/Python/ctypesgen
 install_cmd: cd /app/repo && make install && ldconfig
+venv:
+  reuse: false   # default; always rm -rf /opt/venv and recreate (original behavior)
+  # reuse: true  # opt-in; skip recreation if /opt/venv already matches python_version
