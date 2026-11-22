@@ -64,3 +64,24 @@ submodule_builds: []
 #     env:
 #       CC: gcc
 #     required: true
+
+# --- Phase 2A.3: additional executable builds (opt-in) ---------------------
+# Empty/absent preserves original behavior. Each entry builds a separate
+# executable after the 2A.2 submodule stages (`after: submodules`, default)
+# or after the main build+install (`after: build`). The 2A.2 exports
+# (PATH/LD_LIBRARY_PATH/PKG_CONFIG_PATH/CPPFLAGS/LDFLAGS/CMAKE_PREFIX_PATH)
+# are active for these scripts.
+executable_builds: []
+# Example (replace the empty list above):
+# executable_builds:
+#   - name: lanlgeomag-tool
+#     path: tools/lanlgeomag-tool
+#     after: submodules          # or: build
+#     script: |
+#       set -eux
+#       gcc -o lanlgeomag-tool main.c $CPPFLAGS $LDFLAGS -lLanlGeoMag
+#     install_script: |
+#       install -m 0755 lanlgeomag-tool /usr/local/bin/
+#     env:
+#       CC: gcc
+#     required: true

@@ -29,6 +29,7 @@ DEFAULT_BASE = "registry.access.redhat.com/ubi8/ubi:latest"
 CONTAINERFILE = Path("Containerfile")
 ENV_FILE = Path("autoprobe-env.sh")
 SUBMODULE_MARKER_DIR = "/opt/autoprobe/submodules"
+EXECUTABLE_MARKER_DIR = "/opt/autoprobe/executables"
 
 # UBI ships a CodeReady Builder repo (disabled by default) with extra -devel packages.
 ENABLE_CRB = ("sed -i '/^\\[ubi-8-codeready-builder\\]/,/^\\[/ s/^enabled *= *0/enabled = 1/' "
@@ -98,7 +99,63 @@ class Prober:
         self.submodule_builds: list[dict] = self._parse_submodule_builds(
             cfg.get("submodule_builds"))
 
-    # ---- submodule_builds (new in 2A.2) ------------------------------------
+        # --- second executable builds (new in 2A.3) ---
+        # Absent/empty executable_builds preserves original behavior exactly.
+        self.executable_builds: list[dict] = self._parse_executable_builds(
+            cfg.get("executable_builds"))
+
+    # ---- submodule_builds / executable_builds (new in 2A.2 / 2A.3) ---------
+    def _parse_stage_common(self, item, where: str, repo: Path) -> dict:
+        """Validate fields shared by submodule_builds and executable_builds."""
+        if not isinstance(item, dict):
+            raise ValueError(f"{where} must be a mapping")
+
+        name = str(item.get("name") or "").strip()
+        path = str(item.get("path") or "").strip()
+        script = item.get("script")
+
+        if not name:
+            raise ValueError(f"{where}: missing 'name'")
+        if name in (".", "..") or not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+            raise ValueError(
+                f"{where}: 'name' must match [A-Za-z0-9_.-]+ and not be '.' or '..'")
+
+        if not path:
+            raise ValueError(f"{where}: missing 'path'")
+        rel = Path(path)
+        if rel.is_absolute() or ".." in rel.parts:
+            raise ValueError(
+                f"{where}: 'path' must be relative to repo_name and stay inside it")
+        if not (repo / rel).is_dir():
+            raise ValueError(f"{where}: path not found: {repo / rel}")
+
+        if not isinstance(script, str) or not script.strip():
+            raise ValueError(f"{where}: 'script' must be a non-empty string")
+
+        env_raw = item.get("env") or {}
+        if not isinstance(env_raw, dict):
+            raise ValueError(f"{where}: 'env' must be a mapping")
+        env: dict[str, str] = {}
+        for key, val in env_raw.items():
+            key = str(key)
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                raise ValueError(f"{where}: invalid env var name {key!r}")
+            env[key] = str(val)
+
+        required = item.get("required", True)
+        if isinstance(required, str):
+            required = required.strip().lower() not in {"", "0", "false", "no", "off"}
+        else:
+            required = bool(required)
+
+        return {
+            "name": name,
+            "path": rel.as_posix(),
+            "script": script.rstrip("\n") + "\n",
+            "env": env,
+            "required": required,
+        }
+
     def _parse_submodule_builds(self, raw) -> list[dict]:
         """Validate/normalize config.yaml's optional `submodule_builds:` list.
 
@@ -116,33 +173,10 @@ class Prober:
 
         for idx, item in enumerate(raw, 1):
             where = f"submodule_builds[{idx}]"
-            if not isinstance(item, dict):
-                raise ValueError(f"{where} must be a mapping")
-
-            name = str(item.get("name") or "").strip()
-            path = str(item.get("path") or "").strip()
-            script = item.get("script")
-
-            if not name:
-                raise ValueError(f"{where}: missing 'name'")
-            if name in (".", "..") or not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
-                raise ValueError(
-                    f"{where}: 'name' must match [A-Za-z0-9_.-]+ and not be '.' or '..'")
-            if name in seen:
-                raise ValueError(f"{where}: duplicate name {name!r}")
-            seen.add(name)
-
-            if not path:
-                raise ValueError(f"{where}: missing 'path'")
-            rel = Path(path)
-            if rel.is_absolute() or ".." in rel.parts:
-                raise ValueError(
-                    f"{where}: 'path' must be relative to repo_name and stay inside it")
-            if not (repo / rel).is_dir():
-                raise ValueError(f"{where}: path not found: {repo / rel}")
-
-            if not isinstance(script, str) or not script.strip():
-                raise ValueError(f"{where}: 'script' must be a non-empty string")
+            stage = self._parse_stage_common(item, where, repo)
+            if stage["name"] in seen:
+                raise ValueError(f"{where}: duplicate name {stage['name']!r}")
+            seen.add(stage["name"])
 
             prefix = str(item.get("prefix") or "/usr/local").strip()
             if not prefix.startswith("/"):
@@ -150,22 +184,6 @@ class Prober:
             if prefix != "/":
                 prefix = prefix.rstrip("/") or "/"
             base = "" if prefix == "/" else prefix
-
-            env_raw = item.get("env") or {}
-            if not isinstance(env_raw, dict):
-                raise ValueError(f"{where}: 'env' must be a mapping")
-            env: dict[str, str] = {}
-            for key, val in env_raw.items():
-                key = str(key)
-                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
-                    raise ValueError(f"{where}: invalid env var name {key!r}")
-                env[key] = str(val)
-
-            required = item.get("required", True)
-            if isinstance(required, str):
-                required = required.strip().lower() not in {"", "0", "false", "no", "off"}
-            else:
-                required = bool(required)
 
             def dirs(key: str, defaults: list[str]) -> list[str]:
                 val = item.get(key)
@@ -182,13 +200,8 @@ class Prober:
                     out.append(entry)
                 return out
 
-            stages.append({
-                "name": name,
-                "path": rel.as_posix(),
-                "script": script.rstrip("\n") + "\n",
+            stage.update({
                 "prefix": prefix,
-                "env": env,
-                "required": required,
                 "bin_dirs": dirs("bin_dirs", [f"{base}/bin"]),
                 "lib_dirs": dirs("lib_dirs", [f"{base}/lib", f"{base}/lib64"]),
                 "include_dirs": dirs("include_dirs", [f"{base}/include"]),
@@ -198,6 +211,47 @@ class Prober:
                     f"{base}/share/pkgconfig",
                 ]),
             })
+            stages.append(stage)
+        return stages
+
+    def _parse_executable_builds(self, raw) -> list[dict]:
+        """Validate/normalize config.yaml's optional `executable_builds:` list.
+
+        Each entry builds a separate executable after the 2A.2 submodule stages
+        (`after: submodules`, default) or after the main build+install
+        (`after: build`). Absent/empty preserves original behavior.
+        """
+        if raw is None:
+            return []
+        if not isinstance(raw, list):
+            raise ValueError("executable_builds must be a list of mappings")
+
+        stages: list[dict] = []
+        seen: set[str] = set()
+        repo = Path(self.repo)
+
+        for idx, item in enumerate(raw, 1):
+            where = f"executable_builds[{idx}]"
+            stage = self._parse_stage_common(item, where, repo)
+            if stage["name"] in seen:
+                raise ValueError(f"{where}: duplicate name {stage['name']!r}")
+            seen.add(stage["name"])
+
+            install_script = item.get("install_script") or ""
+            if not isinstance(install_script, str):
+                raise ValueError(f"{where}: 'install_script' must be a string")
+
+            after = str(item.get("after") or "submodules").strip().lower()
+            if after not in ("submodules", "build"):
+                raise ValueError(
+                    f"{where}: 'after' must be 'submodules' or 'build' (got {after!r})")
+
+            stage.update({
+                "install_script": (install_script.rstrip("\n") + "\n")
+                                  if install_script.strip() else "",
+                "after": after,
+            })
+            stages.append(stage)
         return stages
 
     def submodule_export_dirs(self) -> dict[str, list[str]]:
@@ -253,42 +307,68 @@ class Prober:
         return ("# --- submodule_builds exports (generated by autoprobe) ---\n"
                 + "\n".join(lines) + "\n")
 
-    def submodule_stage_script(self, stage: dict) -> str:
-        """One idempotent, diagnose-friendly shell block for a single stage."""
-        marker = f"{SUBMODULE_MARKER_DIR}/{stage['name']}"
+    def _guarded_stage_script(self, marker_dir: str, name: str, cwd: str,
+                              env_lines: list[str], script: str,
+                              install_script: str = "", required: bool = True,
+                              label: str = "Stage", detail: str = "") -> str:
+        """Idempotent, diagnose-friendly shell block shared by both stage types."""
+        marker = f"{marker_dir}/{name}"
         done_q = shlex.quote(marker + ".done")
         skipped_q = shlex.quote(marker + ".skipped")
-        repo_q = shlex.quote(f"/app/repo/{stage['path']}")
+        cwd_q = shlex.quote(cwd)
 
-        env_lines = [f"export AP_PREFIX={shlex.quote(stage['prefix'])}"]
-        env_lines += [f"export {k}={shlex.quote(v)}" for k, v in stage["env"].items()]
-        body = "\n".join(env_lines) + "\n" + stage["script"]
+        body = ""
+        if env_lines:
+            body += "\n".join(env_lines) + "\n"
+        body += script
+        if install_script:
+            body += install_script
 
-        required = "1" if stage["required"] else "0"
-        skip_msg = f">>> Submodule [{stage['name']}] already handled; skipping"
-        build_msg = f">>> Building submodule [{stage['name']}] ({stage['path']})"
-        fail_msg = f"!! Submodule [{stage['name']}] failed"
+        required_flag = "1" if required else "0"
+        skip_msg = f">>> {label} [{name}] already handled; skipping"
+        build_msg = (f">>> Building {label.lower()} [{name}]"
+                     + (f" ({detail})" if detail else ""))
+        fail_msg = f"!! {label} [{name}] failed"
 
         return (
             f"if [ -f {done_q} ] || [ -f {skipped_q} ]; then\n"
             f"  echo {shlex.quote(skip_msg)}\n"
             f"else\n"
             f"  echo {shlex.quote(build_msg)}\n"
-            f"  mkdir -p {shlex.quote(SUBMODULE_MARKER_DIR)}\n"
+            f"  mkdir -p {shlex.quote(marker_dir)}\n"
             f"  if (\n"
-            f"    cd {repo_q}\n"
+            f"    cd {cwd_q}\n"
             f"{body}"
             f"  ); then\n"
             f"    touch {done_q}\n"
             f"  else\n"
             f"    echo {shlex.quote(fail_msg)} >&2\n"
-            f"    if [ {required} -eq 1 ]; then exit 1; else touch {skipped_q}; fi\n"
+            f"    if [ {required_flag} -eq 1 ]; then exit 1; else touch {skipped_q}; fi\n"
             f"  fi\n"
             f"fi"
         )
 
+    def submodule_stage_script(self, stage: dict) -> str:
+        env_lines = [f"export AP_PREFIX={shlex.quote(stage['prefix'])}"]
+        env_lines += [f"export {k}={shlex.quote(v)}" for k, v in stage["env"].items()]
+        return self._guarded_stage_script(
+            SUBMODULE_MARKER_DIR, stage["name"], f"/app/repo/{stage['path']}",
+            env_lines, stage["script"], required=stage["required"],
+            label="Submodule", detail=stage["path"])
+
     def submodule_stage_scripts(self) -> list[str]:
         return [self.submodule_stage_script(s) for s in self.submodule_builds]
+
+    def executable_stage_script(self, stage: dict) -> str:
+        env_lines = [f"export {k}={shlex.quote(v)}" for k, v in stage["env"].items()]
+        return self._guarded_stage_script(
+            EXECUTABLE_MARKER_DIR, stage["name"], f"/app/repo/{stage['path']}",
+            env_lines, stage["script"], install_script=stage["install_script"],
+            required=stage["required"], label="Executable", detail=stage["path"])
+
+    def executable_stage_scripts(self, after: str) -> list[str]:
+        return [self.executable_stage_script(s) for s in self.executable_builds
+                if s["after"] == after]
 
     # ---- container plumbing -------------------------------------------------
     def sh(self, script: str, echo: bool = True) -> tuple[int, str]:
@@ -352,9 +432,11 @@ class Prober:
         return paths + self.pypath
 
     def build_steps(self) -> list[str]:
-        cmds = [*self.probes, *self.submodule_stage_scripts(), self.build_cmd]
+        cmds = [*self.probes, *self.submodule_stage_scripts(),
+                *self.executable_stage_scripts("submodules"), self.build_cmd]
         if self.install_cmd:
             cmds.append(self.install_cmd)
+        cmds.extend(self.executable_stage_scripts("build"))
         return cmds
 
     def script_build(self) -> str:
@@ -607,7 +689,8 @@ class Prober:
             print(f"\nFAILED. Full log: {LOG_FILE}\nInspect the container with:\n"
                   f"  podman exec -it {self.cname} bash -l\n"
                   f"Add anything you find to config.yaml (packages / pip_packages / env / "
-                  f"source_builds / submodule_builds / build_cmd) and re-run.", file=sys.stderr)
+                  f"source_builds / submodule_builds / executable_builds / "
+                  f"build_cmd) and re-run.", file=sys.stderr)
             return 1
 
         self.write_containerfile()
