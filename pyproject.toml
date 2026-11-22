@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autoprobe"
+version = "1.3.0"
+description = "Probes a git repo inside a throwaway RHEL8/UBI8 container, auto-resolves missing build dependencies, and emits a reproducible Containerfile."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "Randall Rogers" },
+]
+dependencies = [
+    "PyYAML>=6.0",
+]
+
+[project.scripts]
+autoprobe = "autoprobe.__main__:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+packages = ["autoprobe"]
+
+# Non-Python data files, installed relative to sys.prefix (e.g. a venv root),
+# NOT into site-packages. config_loader.py knows to look in
+# <sys.prefix>/share/autoprobe/configs as a fallback when no project-root
+# configs/ directory is found (installed / non-editable case).
+[tool.setuptools.data-files]
+"share/autoprobe/configs" = [
+    "configs/packages.yaml",
+    "configs/source_recipes.yaml",
+    "configs/env_template.sh",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -9,8 +9,10 @@ Resolution order for the configs/ directory:
   2. A `configs/` directory found by walking up from this file's location
      (handles running from a source checkout or an editable install, where
      configs/ sits alongside src/ at the project root).
-  3. `importlib.resources` lookup inside the installed `autoprobe` package,
-     in case a packaging step later vendors configs/ under autoprobe/configs/.
+  3. <sys.prefix>/share/autoprobe/configs - where `pip install .` (non-editable)
+     places configs/ via the data-files mechanism declared in pyproject.toml.
+  4. `importlib.resources` lookup inside the installed `autoprobe` package, in
+     case a future packaging step vendors configs/ under autoprobe/configs/.
 
 All exposed names match the original autoprobe.py constants exactly:
     BASELINE        : list[str]
@@ -26,6 +28,7 @@ All exposed names match the original autoprobe.py constants exactly:
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import yaml
@@ -57,6 +60,11 @@ def _candidate_config_dirs() -> list[Path]:
         if maybe.is_dir():
             candidates.append(maybe)
 
+    # Installed (non-editable) package case: pyproject.toml's
+    # [tool.setuptools.data-files] puts configs/ under
+    # <sys.prefix>/share/autoprobe/configs.
+    candidates.append(Path(sys.prefix) / "share" / "autoprobe" / "configs")
+
     return candidates
 
 
@@ -77,8 +85,9 @@ def _find_config_dir() -> Path:
 
     raise ConfigLoadError(
         "Could not locate the autoprobe configs/ directory. "
-        "Set AUTOPROBE_CONFIG_DIR to its path, or run from a source tree "
-        "that has a configs/ directory alongside src/."
+        "Set AUTOPROBE_CONFIG_DIR to its path, run from a source tree that "
+        "has a configs/ directory alongside src/, or reinstall the package "
+        "(pip install .) so configs/ is placed under <prefix>/share/autoprobe/configs."
     )
 
 
@@ -178,3 +187,4 @@ def reload() -> None:
     SOURCE_RECIPES = data["SOURCE_RECIPES"]
     ENV_SCRIPT = data["ENV_SCRIPT"]
     CONFIG_DIR = data["_config_dir"]
+
