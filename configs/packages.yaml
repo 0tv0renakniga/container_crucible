@@ -1,0 +1,154 @@
+BASELINE:
+- 'make'
+- 'gcc'
+- 'gcc-c++'
+- 'autoconf'
+- 'automake'
+- 'libtool'
+- 'diffutils'
+- 'file'
+- 'tar'
+- 'gzip'
+- 'patch'
+- 'git'
+- 'which'
+- 'pkgconf-pkg-config'
+
+BLOCKED:
+- 'coreutils'
+- 'curl'
+- 'python'
+- 'python3-devel'
+
+COMMAND_TO_PKG:
+  'g++': 'gcc-c++'
+  'c++': 'gcc-c++'
+  'gcc': 'gcc'
+  'cc': 'gcc'
+  'gfortran': 'gcc-gfortran'
+  'f77': 'gcc-gfortran'
+  'f95': 'gcc-gfortran'
+  'make': 'make'
+  'gmake': 'make'
+  'cmake': 'cmake'
+  'autoreconf': 'autoconf'
+  'autoconf': 'autoconf'
+  'autoheader': 'autoconf'
+  'aclocal': 'automake'
+  'automake': 'automake'
+  'libtoolize': 'libtool'
+  'libtool': 'libtool'
+  'cmp': 'diffutils'
+  'diff': 'diffutils'
+  'diff3': 'diffutils'
+  'file': 'file'
+  'patch': 'patch'
+  'git': 'git'
+  'which': 'which'
+  'pkg-config': 'pkgconf-pkg-config'
+  'pkgconf': 'pkgconf-pkg-config'
+  'm4': 'm4'
+  'bison': 'bison'
+  'yacc': 'bison'
+  'flex': 'flex'
+  'lex': 'flex'
+  'perl': 'perl'
+  'swig': 'swig'
+  'gperf': 'gperf'
+  'xz': 'xz'
+  'bzip2': 'bzip2'
+  'unzip': 'unzip'
+  'zip': 'zip'
+  'rsync': 'rsync'
+  'wget': 'wget'
+  'makeinfo': 'texinfo'
+  'texi2any': 'texinfo'
+  'help2man': 'help2man'
+  'msgfmt': 'gettext'
+  'xgettext': 'gettext'
+  'autopoint': 'gettext-devel'
+  'doxygen': 'doxygen'
+  'ar': 'binutils'
+  'ld': 'binutils'
+  'nm': 'binutils'
+  'ranlib': 'binutils'
+  'strip': 'binutils'
+  'mpicc': 'openmpi-devel'
+  'mpicxx': 'openmpi-devel'
+  'mpirun': 'openmpi'
+  'mpif90': 'openmpi-devel'
+  'cargo': 'cargo'
+  'rustc': 'rust'
+
+PIP_TOOLS:
+- 'ninja'
+- 'meson'
+- 'cython'
+- 'maturin'
+- 'scikit-build'
+- 'pytest'
+- 'tox'
+- 'poetry'
+- 'flit'
+- 'pybind11'
+- 'nox'
+
+MACRO_TO_PKG:
+- ['^(AC_PROG_LIBTOOL|LT_INIT|AC_LIBTOOL.*|LT_.*)$', 'libtool']
+- ['^PKG_.*$', 'pkgconf-pkg-config']
+- ['^AX_.*$', 'autoconf-archive']
+- ['^(AM_GNU_GETTEXT.*|AM_ICONV|AM_NLS)$', 'gettext-devel']
+- ['^AM_PATH_PYTHON$', 'automake']
+
+LIB_KEYWORDS:
+- ['\bgsl\b|gslcblas|\bcblas\b', 'gsl-devel']
+- ['hdf5', 'hdf5-devel']
+- ['netcdf', 'netcdf-devel']
+- ['fftw', 'fftw-devel']
+- ['lapack', 'lapack-devel']
+- ['openblas', 'openblas-devel']
+- ['\bblas\b', 'blas-devel']
+- ['gfortran|fortran compiler|no fortran', 'gcc-gfortran']
+- ['\bzlib\b|zlib\.h', 'zlib-devel']
+- ['openssl|libssl|libcrypto', 'openssl-devel']
+- ['libcurl|curl/curl\.h', 'libcurl-devel']
+- ['\bboost\b', 'boost-devel']
+- ['\beigen3?\b', 'eigen3-devel']
+- ['\bmpi\b|mpi\.h|openmpi', 'openmpi-devel']
+- ['cfitsio|fitsio\.h', 'cfitsio-devel']
+- ['\bgmp\b|gmp\.h', 'gmp-devel']
+- ['\bmpfr\b', 'mpfr-devel']
+- ['libxml2', 'libxml2-devel']
+- ['readline', 'readline-devel']
+- ['sqlite', 'sqlite-devel']
+- ['libpng|png\.h', 'libpng-devel']
+- ['libjpeg|jpeglib', 'libjpeg-turbo-devel']
+- ['freetype', 'freetype-devel']
+- ['yaml-cpp', 'yaml-cpp-devel']
+- ['\bncurses\b|curses\.h', 'ncurses-devel']
+- ['libffi', 'libffi-devel']
+- ['bzlib|libbz2|\bbzip2\b', 'bzip2-devel']
+- ['liblzma|lzma\.h', 'xz-devel']
+- ['\bglib-?2?\b', 'glib2-devel']
+
+MODULE_TO_PIP:
+  'yaml': 'pyyaml'
+  'cv2': 'opencv-python-headless'
+  'PIL': 'pillow'
+  'sklearn': 'scikit-learn'
+  'skimage': 'scikit-image'
+  'Bio': 'biopython'
+  'dateutil': 'python-dateutil'
+  'bs4': 'beautifulsoup4'
+  'attr': 'attrs'
+  'serial': 'pyserial'
+  'OpenSSL': 'pyopenssl'
+  'git': 'gitpython'
+  'mpl_toolkits': 'matplotlib'
+  'pkg_resources': 'setuptools'
+  'skbuild': 'scikit-build'
+  'pylab': 'matplotlib'
+  'usb': 'pyusb'
+  'magic': 'python-magic'
+  'Cython': 'cython'
+  'tomli_w': 'tomli-w'

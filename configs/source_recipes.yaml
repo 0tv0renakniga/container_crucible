@@ -1,0 +1,7 @@
+SOURCE_RECIPES:
+  'gsl-devel':
+    name: 'gsl-2.8'
+    script: 'set -eux; cd /tmp; curl -fL --retry 3 https://ftp.gnu.org/gnu/gsl/gsl-2.8.tar.gz -o gsl.tgz; tar xzf gsl.tgz; cd gsl-2.8; ./configure --prefix=/usr/local; make -j"$(nproc)"; make install; echo /usr/local/lib > /etc/ld.so.conf.d/usr-local.conf; ldconfig; cd /; rm -rf /tmp/gsl*'
+  'hdf5-devel':
+    name: 'hdf5-1.14.4-3'
+    script: 'set -eux; (dnf install -y zlib-devel || true); cd /tmp; curl -fL --retry 3 https://github.com/HDFGroup/hdf5/releases/download/hdf5_1.14.4.3/hdf5-1.14.4-3.tar.gz -o hdf5.tgz; tar xzf hdf5.tgz; cd hdf5-1.14.4-3; ./configure --prefix=/usr/local --enable-build-mode=production --enable-hl; make -j"$(nproc)"; make install; echo /usr/local/lib > /etc/ld.so.conf.d/usr-local.conf; ldconfig; test -f /usr/local/include/hdf5.h; cd /; rm -rf /tmp/hdf5*'
