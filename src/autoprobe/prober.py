@@ -7,6 +7,11 @@ Phase 2A.2 adds opt-in C/C++ submodule build stages (`submodule_builds:` in
 config.yaml). Each stage is built once per autoprobe run, before build_cmd, and
 its install tree is exported into PATH / LD_LIBRARY_PATH / PKG_CONFIG_PATH /
 CPPFLAGS / LDFLAGS / CMAKE_PREFIX_PATH for later stages and the main build.
+
+Phase 2B.1/2B.2 add opt-in final-image hardening (`runtime_user:` /
+`permissions:` / `runtime:`). The probe container still builds as root; only
+the generated Containerfile gains a user, ownership fixes, WORKDIR/ENV values,
+and read-only-friendly writable locations.
 """
 from __future__ import annotations
 
@@ -57,6 +62,13 @@ def _as_bool(value, default: bool = False) -> bool:
     if isinstance(value, str):
         return value.strip().lower() not in {"", "0", "false", "no", "off"}
     return bool(value)
+
+
+def _env_line(key: str, value: str) -> str:
+    """Render a Dockerfile ENV line, quoting the value only when needed."""
+    if re.fullmatch(r"[A-Za-z0-9_./:@%+,-]*", value):
+        return f"ENV {key}={value}"
+    return f"ENV {key}={json.dumps(value)}"
 
 
 class Prober:
@@ -117,6 +129,10 @@ class Prober:
         # These affect ONLY write_containerfile(), not the probe container.
         self.runtime_user = self._parse_runtime_user(cfg.get("runtime_user"))
         self.permissions = self._parse_permissions(cfg.get("permissions"), self.runtime_user)
+
+        # --- final-image runtime hardening (new in 2B.2) ---
+        # WORKDIR / extra ENV / read-only-friendly writable locations.
+        self.runtime = self._parse_runtime(cfg.get("runtime"))
 
     # ---- submodule_builds / executable_builds (new in 2A.2 / 2A.3) ---------
     def _parse_stage_common(self, item, where: str, repo: Path) -> dict:
@@ -374,31 +390,103 @@ class Prober:
 
         return {"chown": _dedupe(chown), "chmod": chmod}
 
-    def _runtime_user_setup_script(self) -> str:
-        """Create the runtime user and fix ownership before the USER line."""
+    def _parse_runtime(self, raw) -> dict:
+        """Validate config.yaml's optional `runtime:` block (new in 2B.2).
+
+        Controls the final image only: WORKDIR, extra ENV values, and a
+        read-only friendly writable-location setup. Absent/empty preserves
+        the original behavior.
+        """
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, dict):
+            raise ValueError("runtime must be a mapping")
+
+        workdir = str(raw.get("workdir") or "/app").strip()
+        if not workdir.startswith("/"):
+            raise ValueError("runtime: 'workdir' must be an absolute path")
+        workdir = workdir.rstrip("/") or "/"
+
+        env_raw = raw.get("env") or {}
+        if not isinstance(env_raw, dict):
+            raise ValueError("runtime: 'env' must be a mapping")
+        env: dict[str, str] = {}
+        for key, val in env_raw.items():
+            key = str(key)
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                raise ValueError(f"runtime: invalid env var name {key!r}")
+            if key in {"HOME", "USER"}:
+                raise ValueError(
+                    f"runtime: '{key}' is reserved for the runtime user; "
+                    f"do not set it in runtime.env")
+            env[key] = str(val)
+
+        return {
+            "workdir": workdir,
+            "env": env,
+            "read_only": _as_bool(raw.get("read_only"), False),
+        }
+
+    def runtime_env_lines(self) -> list[str]:
+        """ENV lines contributed by the `runtime:` block (new in 2B.2)."""
+        lines: list[str] = []
+        if self.runtime["read_only"]:
+            lines += [
+                _env_line("TMPDIR", "/tmp"),
+                _env_line("XDG_CACHE_HOME", "/tmp/.cache"),
+                _env_line("XDG_CONFIG_HOME", "/tmp/.config"),
+                _env_line("MPLCONFIGDIR", "/tmp/matplotlib"),
+                _env_line("PYTHONDONTWRITEBYTECODE", "1"),
+            ]
+        lines += [_env_line(k, v) for k, v in self.runtime["env"].items()]
+        return lines
+
+    def runtime_writable_dirs(self) -> list[str]:
+        """Writable locations prepared for a `--read-only` runtime (2B.2)."""
+        if not self.runtime["read_only"]:
+            return []
+        return ["/tmp/.cache", "/tmp/.config", "/tmp/matplotlib"]
+
+    def _runtime_setup_script(self) -> str:
+        """Create the runtime user, fix ownership, and prepare writable dirs.
+
+        Returns "" when neither `runtime_user` nor `runtime.read_only` is set,
+        so the generated Containerfile stays byte-identical by default.
+        """
         u = self.runtime_user
-        assert u is not None
-        owner = f"{shlex.quote(u['name'])}:{shlex.quote(u['group'])}"
+        owner = (f"{shlex.quote(u['name'])}:{shlex.quote(u['group'])}"
+                 if u is not None else None)
         lines = ["set -e"]
-        if u["create"]:
-            lines.append(
-                f"getent group {shlex.quote(u['group'])} >/dev/null 2>&1 || "
-                f"groupadd -g {u['gid']} {shlex.quote(u['group'])}")
-            lines.append(
-                f"getent passwd {shlex.quote(u['name'])} >/dev/null 2>&1 || "
-                f"useradd -u {u['uid']} -g {shlex.quote(u['group'])} "
-                f"-d {shlex.quote(u['home'])} -s {shlex.quote(u['shell'])} "
-                f"-m {shlex.quote(u['name'])}")
-        for path in self.permissions["chown"]:
+
+        if u is not None:
+            if u["create"]:
+                lines.append(
+                    f"getent group {shlex.quote(u['group'])} >/dev/null 2>&1 || "
+                    f"groupadd -g {u['gid']} {shlex.quote(u['group'])}")
+                lines.append(
+                    f"getent passwd {shlex.quote(u['name'])} >/dev/null 2>&1 || "
+                    f"useradd -u {u['uid']} -g {shlex.quote(u['group'])} "
+                    f"-d {shlex.quote(u['home'])} -s {shlex.quote(u['shell'])} "
+                    f"-m {shlex.quote(u['name'])}")
+            home_q = shlex.quote(u["home"])
+            lines.append(f"mkdir -p {home_q}")
+            lines.append(f"chown {owner} {home_q}")
+            for path in self.permissions["chown"]:
+                q = shlex.quote(path)
+                lines.append(f"[ -e {q} ] && chown -R {owner} {q} || true")
+            for entry in self.permissions["chmod"]:
+                q = shlex.quote(entry["path"])
+                lines.append(f"[ -e {q} ] && chmod {entry['mode']} {q} || true")
+
+        for path in self.runtime_writable_dirs():
             q = shlex.quote(path)
-            lines.append(f"[ -e {q} ] && chown -R {owner} {q} || true")
-        for entry in self.permissions["chmod"]:
-            q = shlex.quote(entry["path"])
-            lines.append(f"[ -e {q} ] && chmod {entry['mode']} {q} || true")
-        if u["create"]:
-            q = shlex.quote(u["home"])
-            lines.append(f"[ -d {q} ] && chown {owner} {q} || true")
-        return "\n".join(lines)
+            lines.append(f"mkdir -p {q}")
+            if owner:
+                lines.append(f"chown -R {owner} {q}")
+        if self.runtime["read_only"]:
+            lines.append("chmod 1777 /tmp")
+
+        return "" if len(lines) == 1 else "\n".join(lines)
 
     def submodule_export_dirs(self) -> dict[str, list[str]]:
         """All export directories contributed by submodule_builds, deduped."""
@@ -757,7 +845,7 @@ class Prober:
 
         sub = self.submodule_export_dirs()
         ld_dirs = _dedupe([*sub["lib"], "/usr/local/lib", "/usr/local/lib64"])
-        L = [f"FROM {self.base}", "WORKDIR /app", "",
+        L = [f"FROM {self.base}", f"WORKDIR {self.runtime['workdir']}", "",
              f"ENV LD_LIBRARY_PATH={':'.join(ld_dirs)}", "ENV MPLBACKEND=Agg"]
         if self.python:
             L.append("ENV VIRTUAL_ENV=/opt/venv")
@@ -774,6 +862,7 @@ class Prober:
             L.append(f"ENV CMAKE_PREFIX_PATH={':'.join(cmake_dirs)}")
         if self.py_paths():
             L.append(f"ENV PYTHONPATH={':'.join(self.py_paths())}")
+        L += self.runtime_env_lines()
         L += [
               "COPY autoprobe-env.sh /etc/profile.d/autoprobe.sh"]
         if self.enable_crb:
@@ -791,10 +880,12 @@ class Prober:
         # The build + install are baked into the image, so `podman run -it IMAGE` gives
         # a shell with everything already built.  A failing build fails `podman build`.
         L += ["", f"COPY {self.repo} /app/repo", run(self.script_build())]
+        setup = self._runtime_setup_script()
+        if setup:
+            L += ["", run(setup)]
         if self.runtime_user:
             u = self.runtime_user
-            L += ["", run(self._runtime_user_setup_script()),
-                  f"ENV HOME={u['home']}",
+            L += [_env_line("HOME", u["home"]),
                   f"USER {u['uid']}:{u['gid']}"]
         if self.test_cmd:
             L.append("CMD " + json.dumps(["/bin/bash", "-lc", self.test_cmd]))
@@ -841,7 +932,7 @@ class Prober:
                   f"  podman exec -it {self.cname} bash -l\n"
                   f"Add anything you find to config.yaml (packages / pip_packages / env / "
                   f"source_builds / submodule_builds / executable_builds / "
-                  f"build_cmd) and re-run.", file=sys.stderr)
+                  f"runtime_user / runtime / build_cmd) and re-run.", file=sys.stderr)
             return 1
 
         self.write_containerfile()
@@ -851,9 +942,15 @@ class Prober:
             say("Verifying with a clean podman build + run")
             if stream(["podman", "build", "-t", self.image, "."])[0]:
                 return 1
-            if stream(["podman", "run", "--rm", self.image])[0]:
+            run_args = ["podman", "run", "--rm"]
+            if self.runtime["read_only"]:
+                run_args += ["--read-only", "--tmpfs", "/tmp"]
+            run_args.append(self.image)
+            if stream(run_args)[0]:
                 return 1
         else:
+            ro = " --read-only --tmpfs /tmp" if self.runtime["read_only"] else ""
             print(f"\nSUCCESS. The build is baked into the image. Tinker with:\n"
-                  f"  podman build -t {self.image} . && podman run --rm -it {self.image}")
+                  f"  podman build -t {self.image} . && "
+                  f"podman run --rm -it{ro} {self.image}")
         return 0

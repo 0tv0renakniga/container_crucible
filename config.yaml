@@ -110,3 +110,20 @@ runtime_user: null
 #   chmod:
 #     - path: /app/repo
 #       mode: "0775"
+
+# --- Phase 2B.2: final-image runtime hardening (opt-in) -------------------
+# Controls the generated image only; absent/empty preserves behavior.
+#   workdir:   final WORKDIR (default /app)
+#   env:       extra ENV values for the final image (HOME/USER are reserved)
+#   read_only: prepare writable locations for `podman run --read-only`
+runtime: {}
+# Example:
+# runtime:
+#   workdir: /app/repo
+#   env:
+#     LOG_LEVEL: info
+#   read_only: true
+# With read_only: true, autoprobe exports TMPDIR, XDG_CACHE_HOME,
+# XDG_CONFIG_HOME, MPLCONFIGDIR and PYTHONDONTWRITEBYTECODE, creates/chowns
+# /tmp/.cache, /tmp/.config and /tmp/matplotlib, and `--verify` runs the image
+# with `--read-only --tmpfs /tmp`.
